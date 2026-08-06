@@ -6,6 +6,7 @@ Supports length penalties and multi-dimensional scoring.
 
 import dspy
 from dataclasses import dataclass
+import math
 import re
 from typing import Optional
 
@@ -107,11 +108,20 @@ class LLMJudge:
             )
 
         # Parse scores (clamp to 0-1)
-        correctness = _parse_score(result.correctness)
-        procedure_following = _parse_score(result.procedure_following)
-        epistemic_calibration = _parse_score(result.epistemic_calibration)
-        metric_integrity = _parse_score(result.metric_integrity)
-        conciseness = _parse_score(result.conciseness)
+        correctness = _parse_score(result.correctness, field_name="correctness")
+        procedure_following = _parse_score(
+            result.procedure_following,
+            field_name="procedure_following",
+        )
+        epistemic_calibration = _parse_score(
+            result.epistemic_calibration,
+            field_name="epistemic_calibration",
+        )
+        metric_integrity = _parse_score(
+            result.metric_integrity,
+            field_name="metric_integrity",
+        )
+        conciseness = _parse_score(result.conciseness, field_name="conciseness")
 
         # Length penalty
         length_penalty = 0.0
@@ -269,11 +279,18 @@ def skill_fitness_metric(
     return score
 
 
-def _parse_score(value) -> float:
-    """Parse a score value, handling various LLM output formats."""
-    if isinstance(value, (int, float)):
-        return min(1.0, max(0.0, float(value)))
+def _parse_score(value, *, field_name: str = "score") -> float:
+    """Parse and clamp a judge dimension, failing closed on malformed output.
+
+    A neutral default would turn a broken judge into a passing 0.5 score on all
+    dimensions. Raising aborts the optimization instead of manufacturing signal.
+    """
     try:
-        return min(1.0, max(0.0, float(str(value).strip())))
+        score = float(value if isinstance(value, (int, float)) else str(value).strip())
     except (ValueError, TypeError):
-        return 0.5  # Default to neutral on parse failure
+        raise ValueError(
+            f"Judge returned invalid {field_name} score: {value!r}"
+        ) from None
+    if not math.isfinite(score):
+        raise ValueError(f"Judge returned non-finite {field_name} score: {value!r}")
+    return min(1.0, max(0.0, score))

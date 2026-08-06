@@ -1,12 +1,14 @@
 """Tests for the GEPA-compatible fitness metric."""
 
 import dspy
+import pytest
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 from evolution.core.fitness import (
     FitnessScore,
     SemanticSkillFitnessMetric,
+    _parse_score,
     skill_fitness_metric,
 )
 
@@ -150,3 +152,7 @@ class TestSemanticMetricContract:
 
         assert metric(example, SimpleNamespace(output="")) == 0.0
         judge.score.assert_not_called()
+
+    def test_invalid_judge_dimension_fails_closed(self):
+        with pytest.raises(ValueError, match="correctness"):
+            _parse_score("not-a-score", field_name="correctness")
