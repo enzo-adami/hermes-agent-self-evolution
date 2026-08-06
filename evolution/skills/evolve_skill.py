@@ -15,13 +15,15 @@ from typing import Optional
 import click
 import dspy
 from rich.console import Console
-from rich.panel import Panel
 from rich.table import Table
 
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
-from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
+from evolution.core.fitness import (
+    make_semantic_skill_fitness_metric,
+    skill_fitness_metric,
+)
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
     SkillModule,
@@ -118,6 +120,8 @@ def evolve(
     num_threads: Optional[int] = None,
     lm_timeout: Optional[float] = None,
     lm_retries: Optional[int] = None,
+    scorer: str = "semantic",
+    judge_model: Optional[str] = None,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -145,10 +149,10 @@ def evolve(
     console.print(f"  Description: {skill['description'][:80]}...")
 
     if dry_run:
-        console.print(f"\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
+        console.print("\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
         console.print(f"  Would generate eval dataset (source: {eval_source})")
         console.print(f"  Would run GEPA optimization ({iterations} iterations)")
-        console.print(f"  Would validate constraints and create PR")
+        console.print("  Would validate constraints and create PR")
         return
 
     # ── 2. Build or load evaluation dataset ─────────────────────────────
@@ -191,7 +195,7 @@ def evolve(
     console.print(f"  Split: {len(dataset.train)} train / {len(dataset.val)} val / {len(dataset.holdout)} holdout")
 
     # ── 3. Validate constraints on baseline ─────────────────────────────
-    console.print(f"\n[bold]Validating baseline constraints[/bold]")
+    console.print("\n[bold]Validating baseline constraints[/bold]")
     validator = ConstraintValidator(config)
     # Validate the full file (frontmatter + body): skill_structure checks
     # frontmatter, which load_skill strips from `body`.
@@ -208,10 +212,11 @@ def evolve(
         console.print("[yellow]⚠ Baseline skill has constraint violations — proceeding anyway[/yellow]")
 
     # ── 4. Set up DSPy + GEPA optimizer ─────────────────────────────────
-    console.print(f"\n[bold]Configuring optimizer[/bold]")
+    console.print("\n[bold]Configuring optimizer[/bold]")
     console.print(f"  Optimizer: GEPA ({iterations} iterations)")
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
+    console.print(f"  Scorer: {scorer}")
 
     # Configure DSPy. Generation kwargs are only passed when explicitly set,
     # so the default behavior is unchanged. Reasoning models served by local
@@ -229,6 +234,16 @@ def evolve(
         lm_kwargs["num_retries"] = lm_retries
     lm = dspy.LM(eval_model, **lm_kwargs)
     dspy.configure(lm=lm)
+
+    if scorer == "semantic":
+        judge_kwargs = dict(lm_kwargs)
+        judge_kwargs["temperature"] = 0.0
+        judge_kwargs["max_tokens"] = min(1200, max_tokens or 1200)
+        metric = make_semantic_skill_fitness_metric(
+            dspy.LM(judge_model or eval_model, **judge_kwargs)
+        )
+    else:
+        metric = skill_fitness_metric
 
     # Create the baseline skill module
     baseline_module = SkillModule(skill["body"])
@@ -249,7 +264,7 @@ def evolve(
     # masquerade as an unavailable GEPA API.
     reflection_lm = dspy.LM(optimizer_model, **lm_kwargs)
     optimized_module, optimizer_name = _compile_optimizer(
-        metric=skill_fitness_metric,
+        metric=metric,
         iterations=iterations,
         reflection_lm=reflection_lm,
         baseline_module=baseline_module,
@@ -268,7 +283,7 @@ def evolve(
     material_diff = _has_material_diff(skill["body"], evolved_body)
 
     # ── 7. Validate evolved skill ───────────────────────────────────────
-    console.print(f"\n[bold]Validating evolved skill[/bold]")
+    console.print("\n[bold]Validating evolved skill[/bold]")
     # Same rule as the baseline: validate the reassembled file, not the bare
     # body — otherwise skill_structure always fails and nothing ever deploys.
     evolved_constraints = validator.validate_all(evolved_full, "skill", baseline_text=skill["raw"])
@@ -303,11 +318,11 @@ def evolve(
         # Score baseline
         with dspy.context(lm=lm):
             baseline_pred = baseline_module(task_input=ex.task_input)
-            baseline_score = skill_fitness_metric(ex, baseline_pred)
+            baseline_score = metric(ex, baseline_pred)
             baseline_scores.append(baseline_score)
 
             evolved_pred = optimized_module(task_input=ex.task_input)
-            evolved_score = skill_fitness_metric(ex, evolved_pred)
+            evolved_score = metric(ex, evolved_pred)
             evolved_scores.append(evolved_score)
 
     avg_baseline = sum(baseline_scores) / max(1, len(baseline_scores))
@@ -365,6 +380,8 @@ def evolve(
         "optimizer": optimizer_name,
         "optimizer_model": optimizer_model,
         "eval_model": eval_model,
+        "judge_model": judge_model or eval_model,
+        "scorer": scorer,
         "baseline_score": avg_baseline,
         "evolved_score": avg_evolved,
         "improvement": improvement,
@@ -413,7 +430,15 @@ def evolve(
               help="Parallel rollouts for GEPA evaluation (use 1 for serial local endpoints)")
 @click.option("--lm-timeout", default=None, type=float, help="Per-request LM timeout in seconds")
 @click.option("--lm-retries", default=None, type=int, help="LM retry count on failures")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, max_tokens, temperature, num_threads, lm_timeout, lm_retries):
+@click.option(
+    "--scorer",
+    default="semantic",
+    show_default=True,
+    type=click.Choice(["semantic", "keyword"]),
+    help="Fitness scorer. Keyword is legacy and vulnerable to reward hacking.",
+)
+@click.option("--judge-model", default=None, help="Semantic judge model (defaults to eval model)")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, max_tokens, temperature, num_threads, lm_timeout, lm_retries, scorer, judge_model):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -430,6 +455,8 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         num_threads=num_threads,
         lm_timeout=lm_timeout,
         lm_retries=lm_retries,
+        scorer=scorer,
+        judge_model=judge_model,
     )
 
 
