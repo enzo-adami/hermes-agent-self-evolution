@@ -118,7 +118,9 @@ class SkillModule(dspy.Module):
 
     def forward(self, task_input: str) -> dspy.Prediction:
         result = self.predictor(task_input=task_input)
-        return dspy.Prediction(output=result.output)
+        # Carry the candidate's own size so a metric can price growth during
+        # optimization instead of discovering it at the final constraint gate.
+        return dspy.Prediction(output=result.output, skill_chars=len(self.skill_text))
 
 
 def reassemble_skill(frontmatter: str, evolved_body: str) -> str:

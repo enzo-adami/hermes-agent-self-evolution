@@ -156,3 +156,83 @@ class TestSemanticMetricContract:
     def test_invalid_judge_dimension_fails_closed(self):
         with pytest.raises(ValueError, match="correctness"):
             _parse_score("not-a-score", field_name="correctness")
+
+
+class TestGrowthPenalty:
+    """Growth must cost score during search, not only at the final gate.
+
+    Run 3 (06/08) spent 2h19 producing a candidate that grew +233% and was
+    rejected by the deployment gate; the optimizer never saw size while it
+    could still steer.
+    """
+
+    def test_no_penalty_within_budget(self):
+        from evolution.core.fitness import growth_penalty
+
+        assert growth_penalty(1100, 1000, 0.2) == 0.0
+        assert growth_penalty(1200, 1000, 0.2) == 0.0
+
+    def test_no_penalty_when_shrinking(self):
+        from evolution.core.fitness import growth_penalty
+
+        assert growth_penalty(500, 1000, 0.2) == 0.0
+
+    def test_penalty_ramps_past_budget(self):
+        from evolution.core.fitness import growth_penalty
+
+        mild = growth_penalty(1300, 1000, 0.2)
+        severe = growth_penalty(2000, 1000, 0.2)
+        assert 0.0 < mild < severe <= 0.5
+
+    def test_penalty_is_capped(self):
+        from evolution.core.fitness import growth_penalty
+
+        assert growth_penalty(100_000, 1000, 0.2) == 0.5
+
+    def test_unknown_baseline_is_free(self):
+        from evolution.core.fitness import growth_penalty
+
+        assert growth_penalty(5000, 0, 0.2) == 0.0
+
+
+class TestSemanticMetricPricesGrowth:
+    class _StubJudge:
+        def score(self, **kwargs):
+            from evolution.core.fitness import FitnessScore
+
+            return FitnessScore(
+                correctness=1.0,
+                procedure_following=1.0,
+                epistemic_calibration=1.0,
+                metric_integrity=1.0,
+                conciseness=1.0,
+                feedback="Good.",
+            )
+
+    def _metric(self, baseline_chars):
+        from evolution.core.fitness import SemanticSkillFitnessMetric
+
+        return SemanticSkillFitnessMetric(
+            self._StubJudge(), baseline_chars=baseline_chars, max_growth=0.2
+        )
+
+    def test_oversized_candidate_scores_lower(self):
+        example = dspy.Example(task_input="t", expected_behavior="b")
+        lean = dspy.Prediction(output="done", skill_chars=1000)
+        bloated = dspy.Prediction(output="done", skill_chars=4000)
+        metric = self._metric(1000)
+
+        assert metric(example, bloated) < metric(example, lean)
+
+    def test_feedback_names_the_budget(self):
+        example = dspy.Example(task_input="t", expected_behavior="b")
+        bloated = dspy.Prediction(output="done", skill_chars=4000)
+        result = self._metric(1000)(example, bloated, None, "predictor", None)
+
+        assert "1200" in result.feedback  # 1000 chars + 20% budget
+
+    def test_missing_size_is_not_penalized(self):
+        example = dspy.Example(task_input="t", expected_behavior="b")
+        no_size = dspy.Prediction(output="done")
+
+        assert self._metric(1000)(example, no_size) == 1.0

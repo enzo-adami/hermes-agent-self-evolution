@@ -157,11 +157,45 @@ def _metric_gaming_signal(task_input: str, agent_output: str) -> str | None:
     return output_match.group(0)
 
 
-class SemanticSkillFitnessMetric:
-    """GEPA metric backed by a behavioral LLM judge plus anti-gaming gates."""
+def growth_penalty(
+    candidate_chars: int,
+    baseline_chars: int,
+    max_growth: float,
+) -> float:
+    """Price skill growth on the same scale as the deployment gate.
 
-    def __init__(self, judge: LLMJudge):
+    The constraint validator rejects a candidate whose body grew past
+    ``max_growth``, but only after the whole run has finished. Optimizers that
+    never see size during search happily spend their budget on candidates that
+    cannot ship. This ramps a penalty from 0 at the budget to 0.5 at twice the
+    budget, so growth costs score while there is still time to steer.
+    """
+    if baseline_chars <= 0 or candidate_chars <= baseline_chars:
+        return 0.0
+    growth = (candidate_chars - baseline_chars) / baseline_chars
+    if growth <= max_growth:
+        return 0.0
+    overshoot = growth - max_growth
+    return min(0.5, 0.5 * overshoot / max(max_growth, 0.01))
+
+
+class SemanticSkillFitnessMetric:
+    """GEPA metric backed by a behavioral LLM judge plus anti-gaming gates.
+
+    When ``baseline_chars`` is provided, candidates are also priced on size so
+    the search cannot spend its whole budget on a variant the deployment gate
+    will reject for growth.
+    """
+
+    def __init__(
+        self,
+        judge: LLMJudge,
+        baseline_chars: Optional[int] = None,
+        max_growth: float = 0.2,
+    ):
         self.judge = judge
+        self.baseline_chars = baseline_chars
+        self.max_growth = max_growth
 
     def __call__(
         self,
@@ -196,6 +230,23 @@ class SemanticSkillFitnessMetric:
             )
 
         score = judged.composite
+
+        candidate_chars = getattr(prediction, "skill_chars", None)
+        size_note = ""
+        if self.baseline_chars and candidate_chars:
+            penalty = growth_penalty(
+                candidate_chars, self.baseline_chars, self.max_growth
+            )
+            if penalty > 0.0:
+                score = max(0.0, score - penalty)
+                budget = int(self.baseline_chars * (1 + self.max_growth))
+                size_note = (
+                    f" The instructions are {candidate_chars} characters against a "
+                    f"deployable budget of {budget}; a variant over budget is "
+                    "rejected regardless of quality, so express the behavior more "
+                    "compactly rather than adding sections."
+                )
+
         if pred_name is not None:
             dimensions = (
                 f"task={judged.correctness:.2f}, "
@@ -206,14 +257,20 @@ class SemanticSkillFitnessMetric:
             )
             return dspy.Prediction(
                 score=score,
-                feedback=f"Score {score:.2f} ({dimensions}). {feedback}",
+                feedback=f"Score {score:.2f} ({dimensions}). {feedback}{size_note}",
             )
         return score
 
 
-def make_semantic_skill_fitness_metric(lm) -> SemanticSkillFitnessMetric:
+def make_semantic_skill_fitness_metric(
+    lm,
+    baseline_chars: Optional[int] = None,
+    max_growth: float = 0.2,
+) -> SemanticSkillFitnessMetric:
     """Build one reusable semantic judge for an optimization run."""
-    return SemanticSkillFitnessMetric(LLMJudge(lm=lm))
+    return SemanticSkillFitnessMetric(
+        LLMJudge(lm=lm), baseline_chars=baseline_chars, max_growth=max_growth
+    )
 
 
 def skill_fitness_metric(

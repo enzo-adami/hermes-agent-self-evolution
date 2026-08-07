@@ -244,7 +244,9 @@ def evolve(
         # corrupts the measurement rather than merely shortening it.
         judge_kwargs["max_tokens"] = judge_max_tokens
         metric = make_semantic_skill_fitness_metric(
-            dspy.LM(judge_model or eval_model, **judge_kwargs)
+            dspy.LM(judge_model or eval_model, **judge_kwargs),
+            baseline_chars=len(skill["body"]),
+            max_growth=config.max_prompt_growth,
         )
     else:
         metric = skill_fitness_metric
