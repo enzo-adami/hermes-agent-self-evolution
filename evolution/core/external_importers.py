@@ -9,7 +9,7 @@ already use.
 Supported sources:
   - Claude Code (~/.claude/history.jsonl) — user inputs only
   - GitHub Copilot (~/.copilot/session-state/*/events.jsonl) — full conversations
-  - Hermes Agent (~/.hermes/sessions/*.json) — user + assistant + tool context
+  - Hermes Agent (state.db; legacy JSON only by explicit opt-in) — user + assistant
 
 Usage as standalone CLI:
     python -m evolution.core.external_importers \\
@@ -19,12 +19,14 @@ Usage as standalone CLI:
         --source claude-code --skill my-skill --model openrouter/google/gemini-2.5-flash
 
 Usage from evolve_skill.py:
-    python -m evolution.skills.evolve_skill --skill my-skill --eval-source sessiondb
+    python -m evolution.skills.evolve_skill --skill my-skill \
+        --eval-source sessiondb --hermes-export-policy export-policy.json
 """
 
 import json
 import re
 import random
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -73,6 +75,144 @@ SECRET_PATTERNS = re.compile(
 VALID_DIFFICULTIES = {"easy", "medium", "hard"}
 
 MIN_DATASET_SIZE = 3  # Minimum examples needed to produce a meaningful split
+
+
+class SessionExportPolicyError(ValueError):
+    """A Hermes session export was requested without a valid allowlist."""
+
+
+@dataclass(frozen=True)
+class HermesSessionExportPolicy:
+    """Explicit allowlist for material that may leave the Hermes state store.
+
+    This policy does not try to recognize sensitive prose. A session is
+    eligible only when its exact ID and Hermes source are listed and every
+    available project path resolves to an explicitly allowed directory.
+    Missing or unverifiable metadata fails closed.
+    """
+
+    allowed_session_ids: frozenset[str]
+    allowed_session_sources: frozenset[str]
+    allowed_project_paths: tuple[Path, ...]
+    allow_legacy_json: bool = False
+
+    def __post_init__(self) -> None:
+        if not all(isinstance(value, str) for value in self.allowed_session_ids):
+            raise SessionExportPolicyError(
+                "allowed_session_ids must contain only strings"
+            )
+        if not all(isinstance(value, str) for value in self.allowed_session_sources):
+            raise SessionExportPolicyError(
+                "allowed_session_sources must contain only strings"
+            )
+        session_ids = frozenset(value.strip() for value in self.allowed_session_ids)
+        sources = frozenset(value.strip() for value in self.allowed_session_sources)
+        if not session_ids or "" in session_ids:
+            raise SessionExportPolicyError("allowed_session_ids must contain exact non-empty IDs")
+        if not sources or "" in sources:
+            raise SessionExportPolicyError(
+                "allowed_session_sources must contain exact non-empty sources"
+            )
+
+        roots: list[Path] = []
+        for value in self.allowed_project_paths:
+            if not isinstance(value, (str, Path)):
+                raise SessionExportPolicyError(
+                    "allowed_project_paths must contain only paths"
+                )
+            project = Path(value).expanduser()
+            if not project.is_absolute():
+                raise SessionExportPolicyError(
+                    f"allowed project path must be absolute: {project}"
+                )
+            try:
+                resolved = project.resolve(strict=True)
+            except (OSError, TypeError, ValueError) as exc:
+                raise SessionExportPolicyError(
+                    f"allowed project path is not resolvable: {project}"
+                ) from exc
+            if not resolved.is_dir():
+                raise SessionExportPolicyError(
+                    f"allowed project path is not a directory: {resolved}"
+                )
+            roots.append(resolved)
+        if not roots:
+            raise SessionExportPolicyError("allowed_project_paths must not be empty")
+
+        object.__setattr__(self, "allowed_session_ids", session_ids)
+        object.__setattr__(self, "allowed_session_sources", sources)
+        object.__setattr__(self, "allowed_project_paths", tuple(roots))
+
+    @classmethod
+    def from_file(cls, path: Path) -> "HermesSessionExportPolicy":
+        """Load a strict JSON policy; unknown keys are rejected."""
+        try:
+            payload = json.loads(Path(path).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SessionExportPolicyError(f"cannot read export policy {path}: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise SessionExportPolicyError("export policy must be a JSON object")
+
+        allowed_keys = {
+            "allowed_session_ids",
+            "allowed_session_sources",
+            "allowed_project_paths",
+            "allow_legacy_json",
+        }
+        unknown = set(payload) - allowed_keys
+        if unknown:
+            raise SessionExportPolicyError(
+                "unknown export policy keys: " + ", ".join(sorted(unknown))
+            )
+        for key in (
+            "allowed_session_ids",
+            "allowed_session_sources",
+            "allowed_project_paths",
+        ):
+            if not isinstance(payload.get(key), list):
+                raise SessionExportPolicyError(f"{key} must be a JSON list")
+            if not all(isinstance(value, str) for value in payload[key]):
+                raise SessionExportPolicyError(f"{key} must contain only strings")
+        if not isinstance(payload.get("allow_legacy_json", False), bool):
+            raise SessionExportPolicyError("allow_legacy_json must be boolean")
+
+        return cls(
+            allowed_session_ids=frozenset(payload["allowed_session_ids"]),
+            allowed_session_sources=frozenset(payload["allowed_session_sources"]),
+            allowed_project_paths=tuple(Path(value) for value in payload["allowed_project_paths"]),
+            allow_legacy_json=payload.get("allow_legacy_json", False),
+        )
+
+    def allows_metadata(
+        self,
+        *,
+        session_id: str,
+        session_source: str,
+        cwd: Optional[str],
+        git_repo_root: Optional[str],
+    ) -> bool:
+        """Return True only for exact IDs/sources with resolvable allowed paths."""
+        if session_id not in self.allowed_session_ids:
+            return False
+        if session_source not in self.allowed_session_sources:
+            return False
+
+        candidates = [value for value in (cwd, git_repo_root) if value]
+        if not candidates:
+            return False
+        for value in candidates:
+            path = Path(value).expanduser()
+            if not path.is_absolute():
+                return False
+            try:
+                resolved = path.resolve(strict=True)
+            except (OSError, TypeError, ValueError):
+                return False
+            if not resolved.is_dir():
+                return False
+            if resolved not in self.allowed_project_paths:
+                return False
+        return True
 
 
 def _contains_secret(text: str) -> bool:
@@ -337,9 +477,8 @@ class HermesSessionImporter:
     Modern Hermes stores all session transcripts in a SQLite database
     (``state.db``) with a ``messages`` table (role/content/session_id/timestamp)
     — NOT as per-session JSON files. Older/alternate installs may still expose
-    JSON files under ``<hermes_home>/sessions/*.json``. This importer reads the
-    SQLite store first (the current, canonical location) and falls back to the
-    legacy JSON layout so both work.
+    JSON files under ``<hermes_home>/sessions/*.json``. SQLite is authoritative
+    whenever present; legacy JSON requires explicit policy opt-in.
 
     It mines user messages paired with the assistant's next response (skipping
     intervening tool messages), giving the LLM judge both the task and how it
@@ -382,10 +521,15 @@ class HermesSessionImporter:
         return None
 
     @staticmethod
-    def extract_messages(limit: int = 0) -> list[dict]:
+    def extract_messages(
+        limit: int = 0,
+        export_policy: Optional[HermesSessionExportPolicy] = None,
+    ) -> list[dict]:
         """Read user/assistant pairs from the Hermes state store.
 
-        Tries the SQLite ``state.db`` first, then the legacy JSON layout.
+        Requires an explicit export allowlist. If SQLite exists, its result is
+        authoritative even when empty or unreadable; legacy JSON is never an
+        implicit second source.
 
         Args:
             limit: Maximum messages to return (0 = no limit).
@@ -394,16 +538,26 @@ class HermesSessionImporter:
             List of dicts with keys: source, task_input, assistant_response,
             session_id.
         """
+        if export_policy is None:
+            raise SessionExportPolicyError(
+                "Hermes session export requires an explicit allowlist policy"
+            )
+
         db_path = HermesSessionImporter._resolve_state_db()
         if db_path is not None:
-            msgs = HermesSessionImporter._extract_from_sqlite(db_path, limit)
-            if msgs:
-                return msgs
-        # Fall back to the legacy per-session JSON layout.
-        return HermesSessionImporter._extract_from_json(limit)
+            return HermesSessionImporter._extract_from_sqlite(
+                db_path, export_policy, limit
+            )
+        if export_policy.allow_legacy_json:
+            return HermesSessionImporter._extract_from_json(export_policy, limit)
+        return []
 
     @staticmethod
-    def _extract_from_sqlite(db_path: Path, limit: int = 0) -> list[dict]:
+    def _extract_from_sqlite(
+        db_path: Path,
+        export_policy: HermesSessionExportPolicy,
+        limit: int = 0,
+    ) -> list[dict]:
         """Mine user→assistant pairs from the messages table of state.db.
 
         Walks each session's messages in order, pairing every user message
@@ -415,22 +569,54 @@ class HermesSessionImporter:
 
         messages: list[dict] = []
         try:
-            # Read-only, immutable-friendly connection; never writes or locks.
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            # Both URI mode and SQLite's query_only guard forbid writes.
+            conn = sqlite3.connect(
+                Path(db_path).resolve().as_uri() + "?mode=ro",
+                uri=True,
+            )
+            conn.execute("PRAGMA query_only = ON")
         except sqlite3.Error:
             return []
 
         try:
             conn.row_factory = sqlite3.Row
-            cur = conn.cursor()
-            # Order by session, then message id (chronological within session).
-            cur.execute(
+            # Keep metadata validation and message reads in one snapshot.
+            conn.execute("BEGIN")
+            placeholders = ",".join("?" for _ in export_policy.allowed_session_ids)
+            metadata_rows = conn.execute(
+                "SELECT id, source, cwd, git_repo_root FROM sessions "
+                f"WHERE id IN ({placeholders})",
+                tuple(sorted(export_policy.allowed_session_ids)),
+            ).fetchall()
+            allowed_metadata = {
+                row["id"]: row
+                for row in metadata_rows
+                if export_policy.allows_metadata(
+                    session_id=row["id"],
+                    session_source=row["source"],
+                    cwd=row["cwd"],
+                    git_repo_root=row["git_repo_root"],
+                )
+            }
+            if not allowed_metadata:
+                return []
+
+            allowed_ids = tuple(sorted(allowed_metadata))
+            allowed_placeholders = ",".join("?" for _ in allowed_ids)
+            rows = conn.execute(
                 "SELECT session_id, role, content FROM messages "
                 "WHERE role IN ('user','assistant') AND content IS NOT NULL "
-                "ORDER BY session_id, id"
+                f"AND session_id IN ({allowed_placeholders}) "
+                "ORDER BY session_id, id",
+                allowed_ids,
             )
             pending_user: Optional[str] = None
-            for row in cur:
+            current_session: Optional[str] = None
+            for row in rows:
+                session_id = row["session_id"]
+                if session_id != current_session:
+                    pending_user = None
+                    current_session = session_id
                 role = row["role"]
                 content = row["content"] or ""
                 if role == "user":
@@ -444,21 +630,29 @@ class HermesSessionImporter:
                             "source": "hermes",
                             "task_input": pending_user,
                             "assistant_response": resp,
-                            "session_id": row["session_id"],
+                            "session_id": session_id,
+                            "session_source": allowed_metadata[session_id]["source"],
+                            "project": (
+                                allowed_metadata[session_id]["cwd"]
+                                or allowed_metadata[session_id]["git_repo_root"]
+                            ),
                         })
                         if limit and len(messages) >= limit:
                             break
                     pending_user = None
         except sqlite3.Error:
-            return messages
+            return []
         finally:
             conn.close()
 
         return messages
 
     @staticmethod
-    def _extract_from_json(limit: int = 0) -> list[dict]:
-        """Legacy path: read user/assistant pairs from <hermes>/sessions/*.json."""
+    def _extract_from_json(
+        export_policy: HermesSessionExportPolicy,
+        limit: int = 0,
+    ) -> list[dict]:
+        """Read explicitly enabled, allowlisted legacy JSON sessions."""
         if not HermesSessionImporter.SESSION_DIR.exists():
             return []
 
@@ -480,6 +674,16 @@ class HermesSessionImporter:
                 continue
 
             session_id = data.get("session_id", session_file.stem)
+            session_source = data.get("source", "")
+            cwd = data.get("cwd")
+            git_repo_root = data.get("git_repo_root")
+            if not export_policy.allows_metadata(
+                session_id=session_id,
+                session_source=session_source,
+                cwd=cwd,
+                git_repo_root=git_repo_root,
+            ):
+                continue
 
             # Walk messages: pair each user message with the next assistant
             # response (skipping tool messages in between).
@@ -511,6 +715,8 @@ class HermesSessionImporter:
                     "task_input": user_text,
                     "assistant_response": assistant_text,
                     "session_id": session_id,
+                    "session_source": session_source,
+                    "project": cwd or git_repo_root,
                 })
 
                 if limit and len(messages) >= limit:
@@ -713,6 +919,7 @@ def build_dataset_from_external(
     output_path: Path,
     model: str,
     max_examples: int = 50,
+    hermes_export_policy: Optional[HermesSessionExportPolicy] = None,
 ) -> EvalDataset:
     """Extract messages from external tools, filter for relevance, and save.
 
@@ -726,6 +933,8 @@ def build_dataset_from_external(
         output_path: Directory to write train/val/holdout JSONL files.
         model: LiteLLM model string for relevance scoring.
         max_examples: Maximum eval examples to generate.
+        hermes_export_policy: Exact session/source/project allowlist required
+            whenever ``sources`` contains ``"hermes"``.
 
     Returns:
         EvalDataset with train/val/holdout splits.
@@ -743,7 +952,14 @@ def build_dataset_from_external(
             continue
         label, importer_cls = importers[source]
         console.print(f"\n[bold]Importing from {label}...[/bold]")
-        msgs = importer_cls.extract_messages()
+        if source == "hermes":
+            if hermes_export_policy is None:
+                raise SessionExportPolicyError(
+                    "Hermes session export requires an explicit allowlist policy"
+                )
+            msgs = importer_cls.extract_messages(export_policy=hermes_export_policy)
+        else:
+            msgs = importer_cls.extract_messages()
         console.print(f"  Found {len(msgs)} messages")
         all_messages.extend(msgs)
 
@@ -842,8 +1058,14 @@ def _load_skill_text(skill_name: str, skills_dir: Optional[Path] = None) -> tupl
 @click.option("--model", default="openrouter/google/gemini-2.5-flash",
               help="LiteLLM model string for relevance scoring")
 @click.option("--max-examples", default=50, help="Max eval examples to generate")
+@click.option(
+    "--hermes-export-policy",
+    type=click.Path(exists=True, dir_okay=False, path_type=Path),
+    default=None,
+    help="Strict JSON allowlist required before Hermes sessions may be exported",
+)
 @click.option("--dry-run", is_flag=True, help="Show message counts without LLM scoring")
-def main(source, skill, output, model, max_examples, dry_run):
+def main(source, skill, output, model, max_examples, hermes_export_policy, dry_run):
     """Import external session data into golden eval datasets for self-evolution."""
     console.print(f"\n[bold cyan]External Session Importer[/bold cyan] — skill: [bold]{skill}[/bold]\n")
 
@@ -856,6 +1078,14 @@ def main(source, skill, output, model, max_examples, dry_run):
     console.print(f"  Loaded skill: {skill_name} ({len(skill_text):,} chars)")
 
     sources = [source] if source != "all" else ["claude-code", "copilot", "hermes"]
+    try:
+        export_policy = (
+            HermesSessionExportPolicy.from_file(hermes_export_policy)
+            if hermes_export_policy is not None
+            else None
+        )
+    except SessionExportPolicyError as exc:
+        raise click.ClickException(str(exc)) from exc
 
     if dry_run:
         importers = {
@@ -864,7 +1094,14 @@ def main(source, skill, output, model, max_examples, dry_run):
             "hermes": HermesSessionImporter,
         }
         for src in sources:
-            msgs = importers[src].extract_messages()
+            if src == "hermes":
+                if export_policy is None:
+                    raise click.ClickException(
+                        "Hermes session export requires an explicit allowlist policy"
+                    )
+                msgs = importers[src].extract_messages(export_policy=export_policy)
+            else:
+                msgs = importers[src].extract_messages()
             console.print(f"  {src}: {len(msgs)} messages")
         console.print("\n[bold green]DRY RUN — no LLM calls made.[/bold green]")
         return
@@ -881,6 +1118,7 @@ def main(source, skill, output, model, max_examples, dry_run):
         output_path=output,
         model=model,
         max_examples=max_examples,
+        hermes_export_policy=export_policy,
     )
 
 

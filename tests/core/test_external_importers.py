@@ -34,10 +34,12 @@ from evolution.core.external_importers import (
     main,
     ClaudeCodeImporter,
     CopilotImporter,
+    HermesSessionExportPolicy,
     HermesSessionImporter,
     RelevanceFilter,
     VALID_DIFFICULTIES,
     MIN_DATASET_SIZE,
+    SessionExportPolicyError,
 )
 from evolution.core.dataset_builder import EvalExample
 
@@ -472,14 +474,29 @@ class TestHermesSessionImporter:
     exercise the fallback (_extract_from_json) in isolation."""
 
     @pytest.fixture(autouse=True)
-    def _no_state_db(self, monkeypatch):
+    def _no_state_db(self, monkeypatch, tmp_path):
         # Force the SQLite resolver to find nothing so the JSON fallback runs.
         monkeypatch.setattr(
             HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: None)
         )
+        self.project = tmp_path / "exportable-project"
+        self.project.mkdir()
+        self.policy = HermesSessionExportPolicy(
+            allowed_session_ids=frozenset({"test-session", "s"}),
+            allowed_session_sources=frozenset({"cli"}),
+            allowed_project_paths=(self.project,),
+            allow_legacy_json=True,
+        )
+
+    def _session(self, **fields):
+        return {
+            "source": "cli",
+            "cwd": str(self.project),
+            **fields,
+        }
 
     def test_parses_session_json(self, tmp_path):
-        session = {
+        session = self._session(**{
             "session_id": "test-session",
             "messages": [
                 {"role": "user", "content": "Fix the bug in auth.py"},
@@ -489,11 +506,11 @@ class TestHermesSessionImporter:
                 {"role": "user", "content": "Now run the tests"},
                 {"role": "assistant", "content": "All 42 tests passed."},
             ],
-        }
+        })
         (tmp_path / "session_001.json").write_text(json.dumps(session))
 
         with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
-            msgs = HermesSessionImporter.extract_messages()
+            msgs = HermesSessionImporter.extract_messages(export_policy=self.policy)
 
         assert len(msgs) == 2
         assert msgs[0]["task_input"] == "Fix the bug in auth.py"
@@ -503,66 +520,68 @@ class TestHermesSessionImporter:
         assert msgs[1]["assistant_response"] == "All 42 tests passed."
 
     def test_skips_short_messages(self, tmp_path):
-        session = {
+        session = self._session(**{
             "messages": [
                 {"role": "user", "content": "hi"},
                 {"role": "assistant", "content": "Hello!"},
             ],
-        }
+        })
         (tmp_path / "s.json").write_text(json.dumps(session))
 
         with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
-            msgs = HermesSessionImporter.extract_messages()
+            msgs = HermesSessionImporter.extract_messages(export_policy=self.policy)
         assert len(msgs) == 0
 
     def test_filters_secrets(self, tmp_path):
-        session = {
+        session = self._session(**{
             "messages": [
                 {"role": "user", "content": "Set ANTHROPIC_API_KEY=«redacted:sk-…» in the env"},
                 {"role": "assistant", "content": "Done."},
             ],
-        }
+        })
         (tmp_path / "s.json").write_text(json.dumps(session))
 
         with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
-            msgs = HermesSessionImporter.extract_messages()
+            msgs = HermesSessionImporter.extract_messages(export_policy=self.policy)
         assert len(msgs) == 0
 
     def test_handles_missing_dir(self, tmp_path):
         with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path / "nonexistent"):
-            msgs = HermesSessionImporter.extract_messages()
+            msgs = HermesSessionImporter.extract_messages(export_policy=self.policy)
         assert msgs == []
 
     def test_handles_malformed_json(self, tmp_path):
         (tmp_path / "bad.json").write_text("{not valid json")
 
         with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
-            msgs = HermesSessionImporter.extract_messages()
+            msgs = HermesSessionImporter.extract_messages(export_policy=self.policy)
         assert msgs == []
 
     def test_handles_no_assistant_response(self, tmp_path):
-        session = {
+        session = self._session(**{
             "messages": [
                 {"role": "user", "content": "Do something interesting please"},
             ],
-        }
+        })
         (tmp_path / "s.json").write_text(json.dumps(session))
 
         with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
-            msgs = HermesSessionImporter.extract_messages()
+            msgs = HermesSessionImporter.extract_messages(export_policy=self.policy)
         assert len(msgs) == 1
         assert msgs[0]["assistant_response"] == ""
 
     def test_respects_limit(self, tmp_path):
-        session = {
+        session = self._session(**{
             "messages": [
                 {"role": "user", "content": f"Message number {i} with enough text"} for i in range(10)
             ],
-        }
+        })
         (tmp_path / "s.json").write_text(json.dumps(session))
 
         with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path):
-            msgs = HermesSessionImporter.extract_messages(limit=3)
+            msgs = HermesSessionImporter.extract_messages(
+                limit=3, export_policy=self.policy
+            )
         assert len(msgs) == 3
 
 
@@ -573,20 +592,45 @@ class TestHermesSessionImporterSQLite:
     def _make_db(path, rows):
         """rows: list of (session_id, role, content) in insertion order."""
         import sqlite3
+        project = path.parent / "exportable-project"
+        project.mkdir(exist_ok=True)
         conn = sqlite3.connect(str(path))
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, "
+            "cwd TEXT, git_repo_root TEXT)"
+        )
         conn.execute(
             "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, "
             "session_id TEXT, role TEXT, content TEXT)"
+        )
+        session_ids = sorted({row[0] for row in rows})
+        conn.executemany(
+            "INSERT INTO sessions (id, source, cwd, git_repo_root) VALUES (?,?,?,?)",
+            [(session_id, "cli", str(project), str(project)) for session_id in session_ids],
         )
         conn.executemany(
             "INSERT INTO messages (session_id, role, content) VALUES (?,?,?)", rows
         )
         conn.commit()
         conn.close()
+        return HermesSessionExportPolicy(
+            allowed_session_ids=frozenset(session_ids),
+            allowed_session_sources=frozenset({"cli"}),
+            allowed_project_paths=(project,),
+        )
+
+    def test_requires_policy_before_resolving_any_store(self, monkeypatch):
+        resolver = MagicMock()
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", resolver)
+
+        with pytest.raises(SessionExportPolicyError, match="explicit allowlist"):
+            HermesSessionImporter.extract_messages()
+
+        resolver.assert_not_called()
 
     def test_pairs_user_assistant_skipping_tools(self, tmp_path, monkeypatch):
         db = tmp_path / "state.db"
-        self._make_db(db, [
+        policy = self._make_db(db, [
             ("s1", "user", "Fix the bug in auth.py"),
             ("s1", "assistant", None),          # tool-call turn (no content)
             ("s1", "tool", "file contents"),
@@ -595,7 +639,7 @@ class TestHermesSessionImporterSQLite:
             ("s1", "assistant", "All 42 tests passed."),
         ])
         monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: db))
-        msgs = HermesSessionImporter.extract_messages()
+        msgs = HermesSessionImporter.extract_messages(export_policy=policy)
         assert len(msgs) == 2
         assert msgs[0]["task_input"] == "Fix the bug in auth.py"
         assert msgs[0]["assistant_response"] == "I found the issue and fixed it."
@@ -605,22 +649,22 @@ class TestHermesSessionImporterSQLite:
 
     def test_skips_short_user_messages(self, tmp_path, monkeypatch):
         db = tmp_path / "state.db"
-        self._make_db(db, [
+        policy = self._make_db(db, [
             ("s1", "user", "hi"),
             ("s1", "assistant", "Hello!"),
         ])
         monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: db))
-        assert HermesSessionImporter.extract_messages() == []
+        assert HermesSessionImporter.extract_messages(export_policy=policy) == []
 
     def test_filters_secrets(self, tmp_path, monkeypatch):
         db = tmp_path / "state.db"
-        self._make_db(db, [
+        policy = self._make_db(db, [
             ("s1", "user", "Set ANTHROPIC_API_KEY=«redacted» please here now"),
             ("s1", "assistant", "Done."),
         ])
         monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: db))
         # env var name ANTHROPIC_API_KEY triggers secret filter → dropped
-        assert HermesSessionImporter.extract_messages() == []
+        assert HermesSessionImporter.extract_messages(export_policy=policy) == []
 
     def test_respects_limit(self, tmp_path, monkeypatch):
         db = tmp_path / "state.db"
@@ -628,26 +672,28 @@ class TestHermesSessionImporterSQLite:
         for i in range(10):
             rows.append(("s1", "user", f"Message number {i} with enough text here"))
             rows.append(("s1", "assistant", f"Reply number {i}"))
-        self._make_db(db, rows)
+        policy = self._make_db(db, rows)
         monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: db))
-        assert len(HermesSessionImporter.extract_messages(limit=3)) == 3
+        assert len(
+            HermesSessionImporter.extract_messages(limit=3, export_policy=policy)
+        ) == 3
 
     def test_unpaired_user_dropped(self, tmp_path, monkeypatch):
         db = tmp_path / "state.db"
-        self._make_db(db, [
+        policy = self._make_db(db, [
             ("s1", "user", "A question with no assistant reply following it"),
             ("s1", "user", "Another question that does get answered here"),
             ("s1", "assistant", "Here is the answer."),
         ])
         monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: db))
-        msgs = HermesSessionImporter.extract_messages()
+        msgs = HermesSessionImporter.extract_messages(export_policy=policy)
         assert len(msgs) == 1
         assert msgs[0]["task_input"] == "Another question that does get answered here"
 
     def test_sqlite_preferred_over_json(self, tmp_path, monkeypatch):
         """When state.db yields results, the JSON fallback is not used."""
         db = tmp_path / "state.db"
-        self._make_db(db, [
+        policy = self._make_db(db, [
             ("s1", "user", "A real question from the SQLite store"),
             ("s1", "assistant", "A real answer."),
         ])
@@ -659,15 +705,256 @@ class TestHermesSessionImporterSQLite:
                           {"role": "assistant", "content": "nope"}]}))
         monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: db))
         with patch.object(HermesSessionImporter, "SESSION_DIR", json_dir):
-            msgs = HermesSessionImporter.extract_messages()
+            msgs = HermesSessionImporter.extract_messages(export_policy=policy)
         assert len(msgs) == 1
         assert msgs[0]["task_input"] == "A real question from the SQLite store"
+
+    def test_empty_sqlite_never_falls_through_to_legacy(self, tmp_path, monkeypatch):
+        db = tmp_path / "state.db"
+        base_policy = self._make_db(db, [
+            ("s1", "user", "hi"),
+            ("s1", "assistant", "Hello!"),
+        ])
+        policy = HermesSessionExportPolicy(
+            allowed_session_ids=base_policy.allowed_session_ids,
+            allowed_session_sources=base_policy.allowed_session_sources,
+            allowed_project_paths=base_policy.allowed_project_paths,
+            allow_legacy_json=True,
+        )
+        legacy = MagicMock(side_effect=AssertionError("legacy fallback was read"))
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", lambda: db)
+        monkeypatch.setattr(HermesSessionImporter, "_extract_from_json", legacy)
+
+        assert HermesSessionImporter.extract_messages(export_policy=policy) == []
+        legacy.assert_not_called()
+
+    def test_unreadable_sqlite_never_falls_through_to_legacy(
+        self, tmp_path, monkeypatch
+    ):
+        project = tmp_path / "exportable-project"
+        project.mkdir()
+        db = tmp_path / "state.db"
+        db.write_text("not a SQLite database")
+        policy = HermesSessionExportPolicy(
+            allowed_session_ids=frozenset({"s1"}),
+            allowed_session_sources=frozenset({"cli"}),
+            allowed_project_paths=(project,),
+            allow_legacy_json=True,
+        )
+        legacy = MagicMock(side_effect=AssertionError("legacy fallback was read"))
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", lambda: db)
+        monkeypatch.setattr(HermesSessionImporter, "_extract_from_json", legacy)
+
+        assert HermesSessionImporter.extract_messages(export_policy=policy) == []
+        legacy.assert_not_called()
+
+    def test_only_exactly_allowlisted_sessions_are_read(self, tmp_path, monkeypatch):
+        db = tmp_path / "state.db"
+        base_policy = self._make_db(db, [
+            ("allowed", "user", "Explain the synthetic export test please"),
+            ("allowed", "assistant", "This is the allowed synthetic answer."),
+            ("not-allowed", "user", "This synthetic row must stay excluded"),
+            ("not-allowed", "assistant", "This answer must stay excluded too."),
+        ])
+        policy = HermesSessionExportPolicy(
+            allowed_session_ids=frozenset({"allowed"}),
+            allowed_session_sources=base_policy.allowed_session_sources,
+            allowed_project_paths=base_policy.allowed_project_paths,
+        )
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", lambda: db)
+
+        messages = HermesSessionImporter.extract_messages(export_policy=policy)
+
+        assert [message["session_id"] for message in messages] == ["allowed"]
+
+    @pytest.mark.parametrize(
+        ("source", "cwd", "git_repo_root"),
+        [
+            ("not-allowed", "allowed", "allowed"),
+            ("cli", "outside", "outside"),
+            ("cli", None, None),
+        ],
+    )
+    def test_disallowed_or_missing_metadata_stops_before_message_query(
+        self, tmp_path, monkeypatch, source, cwd, git_repo_root
+    ):
+        import sqlite3
+
+        db = tmp_path / "state.db"
+        policy = self._make_db(db, [
+            ("s1", "user", "This synthetic content must not be queried"),
+            ("s1", "assistant", "Nor this synthetic answer."),
+        ])
+        outside = tmp_path / "restricted-project"
+        outside.mkdir()
+        allowed = str(policy.allowed_project_paths[0])
+        values = {
+            "allowed": allowed,
+            "outside": str(outside),
+            None: None,
+        }
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "UPDATE sessions SET source=?, cwd=?, git_repo_root=? WHERE id='s1'",
+            (source, values[cwd], values[git_repo_root]),
+        )
+        conn.commit()
+        conn.close()
+
+        traced: list[str] = []
+        real_connect = sqlite3.connect
+
+        def traced_connect(*args, **kwargs):
+            connection = real_connect(*args, **kwargs)
+            connection.set_trace_callback(traced.append)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", traced_connect)
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", lambda: db)
+
+        assert HermesSessionImporter.extract_messages(export_policy=policy) == []
+        assert not any("FROM messages" in statement for statement in traced)
+
+    def test_sqlite_open_is_explicitly_read_only_and_byte_stable(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        db = tmp_path / "state.db"
+        policy = self._make_db(db, [
+            ("s1", "user", "Explain this synthetic read-only test"),
+            ("s1", "assistant", "The database must remain byte stable."),
+        ])
+        before = db.read_bytes()
+        calls = []
+        traced: list[str] = []
+        real_connect = sqlite3.connect
+
+        def capture_connect(*args, **kwargs):
+            calls.append((args, kwargs))
+            connection = real_connect(*args, **kwargs)
+            connection.set_trace_callback(traced.append)
+            return connection
+
+        monkeypatch.setattr(sqlite3, "connect", capture_connect)
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", lambda: db)
+
+        assert len(HermesSessionImporter.extract_messages(export_policy=policy)) == 1
+        assert calls[0][1]["uri"] is True
+        assert str(calls[0][0][0]).endswith("?mode=ro")
+        assert "PRAGMA query_only = ON" in traced
+        assert "BEGIN" in traced
+        assert db.read_bytes() == before
 
     def test_resolver_finds_nothing_returns_empty(self, tmp_path, monkeypatch):
         """No state.db and no JSON dir → empty, no crash."""
         monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: None))
         with patch.object(HermesSessionImporter, "SESSION_DIR", tmp_path / "nonexistent"):
-            assert HermesSessionImporter.extract_messages() == []
+            policy = HermesSessionExportPolicy(
+                allowed_session_ids=frozenset({"s1"}),
+                allowed_session_sources=frozenset({"cli"}),
+                allowed_project_paths=(tmp_path,),
+            )
+            assert HermesSessionImporter.extract_messages(export_policy=policy) == []
+
+
+class TestHermesSessionExportPolicy:
+    def test_loads_strict_manifest(self, tmp_path):
+        project = tmp_path / "exportable-project"
+        project.mkdir()
+        manifest = tmp_path / "policy.json"
+        manifest.write_text(json.dumps({
+            "allowed_session_ids": ["s1"],
+            "allowed_session_sources": ["cli"],
+            "allowed_project_paths": [str(project)],
+            "allow_legacy_json": False,
+        }))
+
+        policy = HermesSessionExportPolicy.from_file(manifest)
+
+        assert policy.allowed_session_ids == frozenset({"s1"})
+        assert policy.allowed_session_sources == frozenset({"cli"})
+        assert policy.allowed_project_paths == (project.resolve(),)
+
+    def test_unknown_manifest_key_is_rejected(self, tmp_path):
+        project = tmp_path / "exportable-project"
+        project.mkdir()
+        manifest = tmp_path / "policy.json"
+        manifest.write_text(json.dumps({
+            "allowed_session_ids": ["s1"],
+            "allowed_session_sources": ["cli"],
+            "allowed_project_paths": [str(project)],
+            "permit_everything": True,
+        }))
+
+        with pytest.raises(SessionExportPolicyError, match="unknown"):
+            HermesSessionExportPolicy.from_file(manifest)
+
+    def test_non_string_manifest_values_are_rejected(self, tmp_path):
+        project = tmp_path / "exportable-project"
+        project.mkdir()
+        manifest = tmp_path / "policy.json"
+        manifest.write_text(json.dumps({
+            "allowed_session_ids": ["s1"],
+            "allowed_session_sources": ["cli"],
+            "allowed_project_paths": [42],
+        }))
+
+        with pytest.raises(SessionExportPolicyError, match="only strings"):
+            HermesSessionExportPolicy.from_file(manifest)
+
+    def test_project_path_allowlist_is_exact_not_parent_based(self, tmp_path):
+        parent = tmp_path / "projects"
+        child = parent / "restricted-project"
+        child.mkdir(parents=True)
+        policy = HermesSessionExportPolicy(
+            allowed_session_ids=frozenset({"s1"}),
+            allowed_session_sources=frozenset({"cli"}),
+            allowed_project_paths=(parent,),
+        )
+
+        assert not policy.allows_metadata(
+            session_id="s1",
+            session_source="cli",
+            cwd=str(child),
+            git_repo_root=None,
+        )
+
+    def test_missing_or_unresolvable_project_metadata_is_rejected(self, tmp_path):
+        project = tmp_path / "exportable-project"
+        project.mkdir()
+        policy = HermesSessionExportPolicy(
+            allowed_session_ids=frozenset({"s1"}),
+            allowed_session_sources=frozenset({"cli"}),
+            allowed_project_paths=(project,),
+        )
+
+        assert not policy.allows_metadata(
+            session_id="s1", session_source="cli", cwd=None, git_repo_root=None
+        )
+        assert not policy.allows_metadata(
+            session_id="s1",
+            session_source="cli",
+            cwd=str(tmp_path / "missing"),
+            git_repo_root=None,
+        )
+
+    def test_legacy_store_is_not_touched_without_explicit_opt_in(
+        self, tmp_path, monkeypatch
+    ):
+        project = tmp_path / "exportable-project"
+        project.mkdir()
+        policy = HermesSessionExportPolicy(
+            allowed_session_ids=frozenset({"s1"}),
+            allowed_session_sources=frozenset({"cli"}),
+            allowed_project_paths=(project,),
+        )
+        legacy = MagicMock(side_effect=AssertionError("legacy store was read"))
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", lambda: None)
+        monkeypatch.setattr(HermesSessionImporter, "_extract_from_json", legacy)
+
+        assert HermesSessionImporter.extract_messages(export_policy=policy) == []
+        legacy.assert_not_called()
 
 
 # ── Skill Name Matching ──────────────────────────────────────────────────────
@@ -806,6 +1093,75 @@ class TestRelevanceFilter:
 
 class TestBuildDataset:
     """Test the main orchestration function."""
+
+    def test_hermes_without_policy_hard_fails_before_store_or_scorer(
+        self, tmp_path
+    ):
+        with patch.object(HermesSessionImporter, "extract_messages") as extract, \
+             patch.object(RelevanceFilter, "filter_and_score") as scorer:
+            with pytest.raises(SessionExportPolicyError, match="explicit allowlist"):
+                build_dataset_from_external(
+                    skill_name="categorize",
+                    skill_text="Sort text into topics.",
+                    sources=["hermes"],
+                    output_path=tmp_path / "out",
+                    model="test-model",
+                )
+
+        extract.assert_not_called()
+        scorer.assert_not_called()
+
+    def test_disallowed_hermes_metadata_never_reaches_scorer(
+        self, tmp_path, monkeypatch
+    ):
+        import sqlite3
+
+        allowed = tmp_path / "explicitly-exportable"
+        restricted = tmp_path / "not-exportable"
+        allowed.mkdir()
+        restricted.mkdir()
+        db = tmp_path / "state.db"
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT NOT NULL, "
+            "cwd TEXT, git_repo_root TEXT)"
+        )
+        conn.execute(
+            "CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "session_id TEXT, role TEXT, content TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, source, cwd, git_repo_root) VALUES (?,?,?,?)",
+            ("s1", "cli", str(restricted), str(restricted)),
+        )
+        conn.executemany(
+            "INSERT INTO messages (session_id, role, content) VALUES (?,?,?)",
+            [
+                ("s1", "user", "This synthetic row must never reach scoring"),
+                ("s1", "assistant", "This synthetic answer must not either"),
+            ],
+        )
+        conn.commit()
+        conn.close()
+        policy = HermesSessionExportPolicy(
+            allowed_session_ids=frozenset({"s1"}),
+            allowed_session_sources=frozenset({"cli"}),
+            allowed_project_paths=(allowed,),
+        )
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", lambda: db)
+
+        with patch.object(RelevanceFilter, "filter_and_score") as scorer:
+            dataset = build_dataset_from_external(
+                skill_name="categorize",
+                skill_text="Sort text into topics.",
+                sources=["hermes"],
+                output_path=tmp_path / "out",
+                model="test-model",
+                hermes_export_policy=policy,
+            )
+
+        assert dataset.all_examples == []
+        scorer.assert_not_called()
 
     def test_builds_dataset_with_splits(self, tmp_path):
         """Verify end-to-end: import -> filter -> split -> save."""

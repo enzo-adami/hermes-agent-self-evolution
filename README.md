@@ -42,11 +42,18 @@ python -m evolution.skills.evolve_skill \
     --iterations 10 \
     --eval-source synthetic
 
-# Or use real session history from Claude Code, Copilot, and Hermes
+# Or use real session history. Hermes requires an exact export allowlist.
+# export-policy.json:
+# {
+#   "allowed_session_ids": ["session-id"],
+#   "allowed_session_sources": ["cli"],
+#   "allowed_project_paths": ["/absolute/path/to/exportable-project"]
+# }
 python -m evolution.skills.evolve_skill \
     --skill github-code-review \
     --iterations 10 \
-    --eval-source sessiondb
+    --eval-source sessiondb \
+    --hermes-export-policy export-policy.json
 ```
 
 ## What It Optimizes

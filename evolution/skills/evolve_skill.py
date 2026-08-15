@@ -20,7 +20,11 @@ from rich.table import Table
 
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
-from evolution.core.external_importers import build_dataset_from_external
+from evolution.core.external_importers import (
+    HermesSessionExportPolicy,
+    SessionExportPolicyError,
+    build_dataset_from_external,
+)
 from evolution.core.fitness import skill_fitness_metric, LLMJudge, FitnessScore
 from evolution.core.constraints import ConstraintValidator
 from evolution.skills.skill_module import (
@@ -43,6 +47,7 @@ def evolve(
     hermes_repo: Optional[str] = None,
     run_tests: bool = False,
     dry_run: bool = False,
+    hermes_export_policy: Optional[str] = None,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -83,6 +88,14 @@ def evolve(
         dataset = GoldenDatasetLoader.load(Path(dataset_path))
         console.print(f"  Loaded golden dataset: {len(dataset.all_examples)} examples")
     elif eval_source == "sessiondb":
+        try:
+            export_policy = (
+                HermesSessionExportPolicy.from_file(Path(hermes_export_policy))
+                if hermes_export_policy
+                else None
+            )
+        except SessionExportPolicyError as exc:
+            raise click.ClickException(str(exc)) from exc
         save_path = Path(dataset_path) if dataset_path else Path("datasets") / "skills" / skill_name
         dataset = build_dataset_from_external(
             skill_name=skill_name,
@@ -90,6 +103,7 @@ def evolve(
             sources=["claude-code", "copilot", "hermes"],
             output_path=save_path,
             model=eval_model,
+            hermes_export_policy=export_policy,
         )
         if not dataset.all_examples:
             console.print("[red]✗ No relevant examples found from session history[/red]")
@@ -303,7 +317,14 @@ def evolve(
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run):
+@click.option(
+    "--hermes-export-policy",
+    type=click.Path(exists=True, dir_okay=False),
+    default=None,
+    help="Strict JSON allowlist for Hermes session export",
+)
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model,
+         hermes_repo, run_tests, dry_run, hermes_export_policy):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -315,6 +336,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         hermes_repo=hermes_repo,
         run_tests=run_tests,
         dry_run=dry_run,
+        hermes_export_policy=hermes_export_policy,
     )
 
 
