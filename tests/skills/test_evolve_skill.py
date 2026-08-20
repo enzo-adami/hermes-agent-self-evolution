@@ -241,6 +241,11 @@ def test_noop_candidate_cannot_report_success_from_score_noise(tmp_path, monkeyp
         eval_source="golden",
         dataset_path=str(tmp_path),
         hermes_repo=str(repo),
+        # Pin the lexical scorer: this test stubs skill_fitness_metric to feed
+        # deterministic scores, and the semantic default would build an LLM
+        # judge the stub cannot intercept. The property under test — a no-op
+        # candidate cannot report success from score noise — is scorer-agnostic.
+        scorer="keyword",
     )
 
     metrics_files = list((tmp_path / "output" / "demo").glob("*/metrics.json"))
