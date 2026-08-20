@@ -122,6 +122,7 @@ def evolve(
     lm_retries: Optional[int] = None,
     scorer: str = "semantic",
     judge_model: Optional[str] = None,
+    judge_max_tokens: int = 2500,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -238,7 +239,10 @@ def evolve(
     if scorer == "semantic":
         judge_kwargs = dict(lm_kwargs)
         judge_kwargs["temperature"] = 0.0
-        judge_kwargs["max_tokens"] = min(1200, max_tokens or 1200)
+        # The judge emits reasoning, five scores and feedback in one response.
+        # Capping it too low truncates the tail, which drops score fields and
+        # corrupts the measurement rather than merely shortening it.
+        judge_kwargs["max_tokens"] = judge_max_tokens
         metric = make_semantic_skill_fitness_metric(
             dspy.LM(judge_model or eval_model, **judge_kwargs)
         )
@@ -438,7 +442,9 @@ def evolve(
     help="Fitness scorer. Keyword is legacy and vulnerable to reward hacking.",
 )
 @click.option("--judge-model", default=None, help="Semantic judge model (defaults to eval model)")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, max_tokens, temperature, num_threads, lm_timeout, lm_retries, scorer, judge_model):
+@click.option("--judge-max-tokens", default=2500, type=int,
+              help="Generation budget for the semantic judge (truncation drops score fields)")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, max_tokens, temperature, num_threads, lm_timeout, lm_retries, scorer, judge_model, judge_max_tokens):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -457,6 +463,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         lm_retries=lm_retries,
         scorer=scorer,
         judge_model=judge_model,
+        judge_max_tokens=judge_max_tokens,
     )
 
 
