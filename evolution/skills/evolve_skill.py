@@ -7,6 +7,7 @@ Usage:
 
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 from datetime import datetime
@@ -286,10 +287,11 @@ def evolve(
         # evidence about the optimizer, and a fixed filename silently destroys
         # the previous run's evidence.
         failed_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        output_path = (
-            Path("output") / skill_name / failed_timestamp / "evolved_FAILED.md"
-        )
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        failed_root = Path("output") / skill_name
+        failed_root.mkdir(parents=True, exist_ok=True)
+        # Atomic allocation also preserves runs rejected in the same second.
+        failed_dir = Path(tempfile.mkdtemp(prefix=failed_timestamp + "_", dir=failed_root))
+        output_path = failed_dir / "evolved_FAILED.md"
         output_path.write_text(evolved_full)
         (output_path.parent / "baseline_skill.md").write_text(skill["raw"])
         console.print(f"  Saved failed variant to {output_path}")

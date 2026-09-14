@@ -249,3 +249,50 @@ def test_noop_candidate_cannot_report_success_from_score_noise(tmp_path, monkeyp
     assert metrics["improvement"] == pytest.approx(0.8)
     assert metrics["material_diff"] is False
     assert metrics["success"] is False
+
+
+def test_rejected_runs_in_same_second_preserve_both_artifacts(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    repo = _skill_repo(tmp_path)
+    baseline = (repo / "skills/tests/demo/SKILL.md").read_text()
+    _stub_runtime(monkeypatch, _dataset())
+    monkeypatch.chdir(tmp_path)
+
+    class FrozenDatetime:
+        @staticmethod
+        def now():
+            return datetime(2026, 1, 1)
+
+    monkeypatch.setattr(evolve_skill, "datetime", FrozenDatetime)
+    candidates = iter(["Rejected first candidate", "Rejected second candidate"])
+    monkeypatch.setattr(
+        evolve_skill, "_compile_optimizer",
+        lambda **kwargs: (SimpleNamespace(skill_text=next(candidates)), "GEPA"),
+    )
+    original_validate = evolve_skill.ConstraintValidator.validate_all
+
+    def reject_candidate(self, text, artifact_type, baseline_text=None):
+        if baseline_text is not None:
+            return [ConstraintResult(False, "test_rejection", "Rejected for testing")]
+        return original_validate(self, text, artifact_type)
+
+    monkeypatch.setattr(evolve_skill.ConstraintValidator, "validate_all", reject_candidate)
+    monkeypatch.setattr(
+        evolve_skill, "skill_fitness_metric",
+        lambda *args, **kwargs: pytest.fail("Rejected candidate reached holdout"),
+    )
+    for _ in range(2):
+        evolve_skill.evolve(
+            skill_name="demo", eval_source="golden", dataset_path=str(tmp_path),
+            hermes_repo=str(repo),
+        )
+
+    artifacts = list((tmp_path / "output/demo").glob("*/evolved_FAILED.md"))
+    assert len(artifacts) == 2
+    assert {p.read_text().split("Rejected ")[1] for p in artifacts} == {
+        "first candidate\n", "second candidate\n",
+    }
+    for artifact in artifacts:
+        assert (artifact.parent / "baseline_skill.md").read_text() == baseline
+    assert not list((tmp_path / "output").rglob("metrics.json"))
