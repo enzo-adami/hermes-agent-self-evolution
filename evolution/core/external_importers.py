@@ -939,6 +939,11 @@ def build_dataset_from_external(
     Returns:
         EvalDataset with train/val/holdout splits.
     """
+    if "hermes" in sources and hermes_export_policy is None:
+        raise SessionExportPolicyError(
+            "Hermes session export requires an explicit allowlist policy"
+        )
+
     all_messages = []
 
     importers = {
@@ -1086,6 +1091,11 @@ def main(source, skill, output, model, max_examples, hermes_export_policy, dry_r
         )
     except SessionExportPolicyError as exc:
         raise click.ClickException(str(exc)) from exc
+
+    if "hermes" in sources and export_policy is None:
+        raise click.ClickException(
+            "Hermes session export requires an explicit allowlist policy"
+        )
 
     if dry_run:
         importers = {
