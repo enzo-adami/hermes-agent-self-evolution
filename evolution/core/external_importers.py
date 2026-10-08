@@ -416,7 +416,9 @@ class HermesSessionImporter:
         messages: list[dict] = []
         try:
             # Read-only, immutable-friendly connection; never writes or locks.
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            # as_uri() percent-encodes '?' and '#', which a raw path would
+            # turn into URI query/fragment delimiters.
+            conn = sqlite3.connect(Path(db_path).resolve().as_uri() + "?mode=ro", uri=True)
         except sqlite3.Error:
             return []
 
@@ -430,7 +432,13 @@ class HermesSessionImporter:
                 "ORDER BY session_id, id"
             )
             pending_user: Optional[str] = None
+            current_session: Optional[str] = None
             for row in cur:
+                if row["session_id"] != current_session:
+                    # A user turn left unanswered must not pair with the
+                    # first assistant message of the next session.
+                    pending_user = None
+                    current_session = row["session_id"]
                 role = row["role"]
                 content = row["content"] or ""
                 if role == "user":

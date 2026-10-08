@@ -644,6 +644,27 @@ class TestHermesSessionImporterSQLite:
         assert len(msgs) == 1
         assert msgs[0]["task_input"] == "Another question that does get answered here"
 
+    def test_unanswered_user_does_not_pair_with_next_session(self, tmp_path, monkeypatch):
+        db = tmp_path / "state.db"
+        self._make_db(db, [
+            ("s1", "user", "A question left unanswered at the end of s1"),
+            ("s2", "assistant", "The opening message of a different session."),
+        ])
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: db))
+        assert HermesSessionImporter.extract_messages() == []
+
+    def test_reads_db_whose_path_has_uri_characters(self, tmp_path, monkeypatch):
+        db_dir = tmp_path / "odd?dir#1"
+        db_dir.mkdir()
+        db = db_dir / "state.db"
+        self._make_db(db, [
+            ("s1", "user", "A question stored under an awkward path"),
+            ("s1", "assistant", "An answer stored under an awkward path."),
+        ])
+        monkeypatch.setattr(HermesSessionImporter, "_resolve_state_db", staticmethod(lambda: db))
+        msgs = HermesSessionImporter.extract_messages()
+        assert [m["task_input"] for m in msgs] == ["A question stored under an awkward path"]
+
     def test_sqlite_preferred_over_json(self, tmp_path, monkeypatch):
         """When state.db yields results, the JSON fallback is not used."""
         db = tmp_path / "state.db"
