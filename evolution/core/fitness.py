@@ -18,8 +18,9 @@ class FitnessScore:
     """Multi-dimensional fitness score."""
     correctness: float = 0.0  # Did the agent produce correct output? (0-1)
     procedure_following: float = 0.0  # Did it follow the skill's procedure? (0-1)
-    epistemic_calibration: float = 0.0  # Are claims supported and calibrated? (0-1)
-    metric_integrity: float = 1.0  # Is this behavior rather than scorer gaming? (0-1)
+    # Judge-only dimensions; None when the scorer does not measure them.
+    epistemic_calibration: Optional[float] = None  # Are claims supported and calibrated? (0-1)
+    metric_integrity: Optional[float] = None  # Is this behavior rather than scorer gaming? (0-1)
     conciseness: float = 0.0  # Was it appropriately concise? (0-1)
     length_penalty: float = 0.0  # Penalty for being too verbose (0-1, 0 = no penalty)
     feedback: str = ""  # Textual feedback for GEPA's reflective analysis
@@ -27,11 +28,24 @@ class FitnessScore:
     @property
     def composite(self) -> float:
         """Weighted composite score."""
+        if self.epistemic_calibration is None and self.metric_integrity is None:
+            # Scorers that measure only the original three dimensions (the
+            # objective verifiers) keep the original weighting: a perfect
+            # answer scores 1.0, not the 0.85 the judge weights would cap it at.
+            raw = (
+                0.5 * self.correctness
+                + 0.3 * self.procedure_following
+                + 0.2 * self.conciseness
+            )
+            return max(0.0, raw - self.length_penalty)
+
+        epistemic_calibration = self.epistemic_calibration or 0.0
+        metric_integrity = 1.0 if self.metric_integrity is None else self.metric_integrity
         raw = (
             0.45 * self.correctness
             + 0.30 * self.procedure_following
-            + 0.15 * self.epistemic_calibration
-            + 0.05 * self.metric_integrity
+            + 0.15 * epistemic_calibration
+            + 0.05 * metric_integrity
             + 0.05 * self.conciseness
         )
         score = max(0.0, raw - self.length_penalty)
@@ -40,7 +54,7 @@ class FitnessScore:
         # a primary behavioral failure.
         if self.correctness < 0.5 or self.procedure_following < 0.5:
             score = min(score, 0.49)
-        if self.metric_integrity < 0.5:
+        if metric_integrity < 0.5:
             score = min(score, 0.1)
         return score
 

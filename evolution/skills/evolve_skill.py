@@ -26,6 +26,7 @@ from evolution.core.fitness import (
     skill_fitness_metric,
 )
 from evolution.core.constraints import ConstraintValidator
+from evolution.core.verifier import get_verifier, verifier_metric
 from evolution.skills.skill_module import (
     SkillModule,
     load_skill,
@@ -124,6 +125,7 @@ def evolve(
     scorer: str = "semantic",
     judge_model: Optional[str] = None,
     judge_max_tokens: int = 2500,
+    fitness: str = "auto",
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -150,17 +152,46 @@ def evolve(
     console.print(f"  Size: {len(skill['raw']):,} chars")
     console.print(f"  Description: {skill['description'][:80]}...")
 
+    # Resolve the fitness signal. An objective verifier grades outputs
+    # against checkable ground truth; --scorer is the fallback.
+    verifier = None
+    if fitness in ("auto", "verifier"):
+        verifier = get_verifier(skill_name) or get_verifier(skill["name"])
+        if fitness == "verifier" and verifier is None:
+            console.print(f"[red]✗ No verifier registered for skill '{skill_name}'[/red]")
+            sys.exit(1)
+    if verifier is not None:
+        fitness_label = "objective verifier"
+    elif scorer == "semantic":
+        fitness_label = "semantic judge"
+    else:
+        fitness_label = "keyword overlap"
+
     if dry_run:
         console.print("\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
-        console.print(f"  Would generate eval dataset (source: {eval_source})")
-        console.print(f"  Would run GEPA optimization ({iterations} iterations)")
+        console.print(f"  Would generate eval dataset (source: {'verifier' if verifier else eval_source})")
+        console.print(f"  Would run GEPA optimization ({iterations} iterations, fitness: {fitness_label})")
         console.print("  Would validate constraints and create PR")
         return
 
     # ── 2. Build or load evaluation dataset ─────────────────────────────
-    console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {eval_source})")
+    console.print(f"\n[bold]Building evaluation dataset[/bold] (source: {'verifier' if verifier else eval_source})")
 
-    if eval_source == "golden" and dataset_path:
+    if verifier is not None:
+        # Verifier tasks carry their own ground truth, so the dataset and
+        # the fitness function must come from the same place.
+        if dataset_path or eval_source != "synthetic":
+            console.print(
+                "[yellow]  Note: the objective verifier supplies its own dataset; "
+                "--eval-source/--dataset-path are ignored. "
+                "Use --fitness scorer to evolve against a custom dataset.[/yellow]"
+            )
+        dataset = verifier.build_dataset()
+        save_path = Path("datasets") / "skills" / f"{skill_name}-verifier"
+        dataset.save(save_path)
+        console.print(f"  Built {len(dataset.all_examples)} verified examples (objective ground truth)")
+        console.print(f"  Saved to {save_path}/")
+    elif eval_source == "golden" and dataset_path:
         dataset = GoldenDatasetLoader.load(Path(dataset_path))
         console.print(f"  Loaded golden dataset: {len(dataset.all_examples)} examples")
     elif eval_source == "sessiondb":
@@ -218,7 +249,7 @@ def evolve(
     console.print(f"  Optimizer: GEPA ({iterations} iterations)")
     console.print(f"  Optimizer model: {optimizer_model}")
     console.print(f"  Eval model: {eval_model}")
-    console.print(f"  Scorer: {scorer}")
+    console.print(f"  Fitness: {fitness_label}")
 
     # Configure DSPy. Generation kwargs are only passed when explicitly set,
     # so the default behavior is unchanged. Reasoning models served by local
@@ -237,7 +268,9 @@ def evolve(
     lm = dspy.LM(eval_model, **lm_kwargs)
     dspy.configure(lm=lm)
 
-    if scorer == "semantic":
+    if verifier is not None:
+        metric = verifier_metric(verifier)
+    elif scorer == "semantic":
         judge_kwargs = dict(lm_kwargs)
         judge_kwargs["temperature"] = 0.0
         # The judge emits reasoning, five scores and feedback in one response.
@@ -408,6 +441,7 @@ def evolve(
         "holdout_examples": len(dataset.holdout),
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
+        "fitness": fitness_label,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
@@ -454,7 +488,11 @@ def evolve(
 @click.option("--judge-model", default=None, help="Semantic judge model (defaults to eval model)")
 @click.option("--judge-max-tokens", default=2500, type=int,
               help="Generation budget for the semantic judge (truncation drops score fields)")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, max_tokens, temperature, num_threads, lm_timeout, lm_retries, scorer, judge_model, judge_max_tokens):
+@click.option("--fitness", default="auto", type=click.Choice(["auto", "verifier", "scorer"]),
+              help="Fitness signal: auto uses an objective verifier when one is registered "
+                   "for the skill and --scorer otherwise, verifier requires one, scorer "
+                   "always uses --scorer")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, max_tokens, temperature, num_threads, lm_timeout, lm_retries, scorer, judge_model, judge_max_tokens, fitness):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -474,6 +512,7 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         scorer=scorer,
         judge_model=judge_model,
         judge_max_tokens=judge_max_tokens,
+        fitness=fitness,
     )
 
 
