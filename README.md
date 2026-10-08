@@ -66,9 +66,10 @@ Evolution is only as trustworthy as the score it optimizes. The pipeline picks t
 | Signal | How it scores | Trust |
 |--------|--------------|-------|
 | **Objective verifier** | Checks output against verifiable ground truth (IDs, titles, authors, dates); pure Python, zero API cost per grade | Highest: cannot be gamed by echoing rubric vocabulary |
-| **Keyword overlap** | Lexical overlap between output and rubric text | Fallback only |
+| **Semantic judge** (`--scorer semantic`, default) | An LLM judge scores task outcome, procedure, calibration and evaluator gaming; one judge call per grade | Good: judges behavior, not shared words |
+| **Keyword overlap** (`--scorer keyword`) | Lexical overlap between output and rubric text | Legacy: an evolved skill can win by echoing rubric words |
 
-Skills with a registered verifier (currently: `arxiv`) evolve against real facts by default. Verifier feedback explains exactly what was wrong ("expected ID 1706.03762, response said 1706.03799"), which is the reflection signal GEPA mutates on.
+Skills with a registered verifier (currently: `arxiv`) evolve against real facts by default; other skills use `--scorer`. Pass `--fitness scorer` to use `--scorer` even when a verifier exists. Verifier feedback explains exactly what was wrong ("expected ID 1706.03762, response said 1706.03799"), which is the reflection signal GEPA mutates on.
 
 ```bash
 # Objective fitness is picked automatically when a verifier exists
