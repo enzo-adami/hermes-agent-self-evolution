@@ -7,6 +7,7 @@ Usage:
 
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 from datetime import datetime
@@ -303,10 +304,17 @@ def evolve(
 
     if not all_pass:
         console.print("[red]✗ Evolved skill FAILED constraints — not deploying[/red]")
-        # Still save for inspection
-        output_path = Path("output") / skill_name / "evolved_FAILED.md"
-        output_path.parent.mkdir(parents=True, exist_ok=True)
+        # Save for inspection under this run's timestamp: a rejected variant is
+        # evidence about the optimizer, and a fixed filename silently destroys
+        # the previous run's evidence.
+        failed_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        failed_root = Path("output") / skill_name
+        failed_root.mkdir(parents=True, exist_ok=True)
+        # Atomic allocation also preserves runs rejected in the same second.
+        failed_dir = Path(tempfile.mkdtemp(prefix=failed_timestamp + "_", dir=failed_root))
+        output_path = failed_dir / "evolved_FAILED.md"
         output_path.write_text(evolved_full)
+        (output_path.parent / "baseline_skill.md").write_text(skill["raw"])
         console.print(f"  Saved failed variant to {output_path}")
         return
 
