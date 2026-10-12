@@ -15,6 +15,7 @@ import dspy
 import pytest
 
 from evolution.core.fitness import FitnessScore, SemanticSkillFitnessMetric
+from evolution.core.hermes_lm import HermesLM, make_lm
 from evolution.core.hermes_runner import HermesRunner, parse_stream_json
 from evolution.skills.skill_module import HermesSkillModule
 
@@ -25,6 +26,12 @@ FAKE_HERMES = textwrap.dedent(
 
     args = sys.argv[1:]
     home = Path(os.environ["HERMES_HOME"])
+    if "--query-file" in args:
+        prompt = Path(args[args.index("--query-file") + 1]).read_text()
+        answer = {"prompt": prompt, "args": args,
+                  "profile_files": sorted(p.name for p in home.iterdir() if p.is_file())}
+        print(json.dumps({"type": "result", "exit_code": 0, "text": json.dumps(answer)}))
+        sys.exit(0)
     skill = args[args.index("-s") + 1]
     task = args[args.index("-q") + 1]
     if task == "sleep":
@@ -190,3 +197,35 @@ class TestSemanticMetricSeesTranscript:
 
         metric(example, dspy.Prediction(output="All green."))
         assert seen["agent_output"] == "All green."
+
+
+class TestHermesLM:
+    def test_answers_through_hermes_with_no_tools(self, fake_hermes, profile):
+        lm = HermesLM(HermesRunner(command=fake_hermes, source_home=profile, model="m1"))
+
+        [answer] = lm(messages=[
+            {"role": "system", "content": "You propose instructions."},
+            {"role": "user", "content": 'Improve this skill: "quoted" $text'},
+        ])
+        echoed = json.loads(answer)
+
+        assert echoed["prompt"].startswith("You propose instructions.")
+        assert 'Improve this skill: "quoted" $text' in echoed["prompt"]
+        args = echoed["args"]
+        assert args[args.index("-t") + 1] == "none"
+        assert args[args.index("-m") + 1] == "m1"
+        assert "-s" not in args
+        assert echoed["profile_files"] == [".env", ".no-bundled-skills", "config.yaml"]
+
+    def test_a_failed_run_raises_instead_of_answering_empty(self, profile):
+        lm = HermesLM(HermesRunner(command=("/nonexistent/hermes",), source_home=profile))
+        with pytest.raises(RuntimeError, match="Hermes did not answer"):
+            lm("anything")
+
+    def test_make_lm_routes_hermes_model_names(self, fake_hermes):
+        runner = HermesRunner(command=fake_hermes, model="from-profile")
+        assert isinstance(make_lm("hermes", runner=runner), HermesLM)
+        assert make_lm("hermes", runner=runner).runner.model == "from-profile"
+        assert make_lm("hermes/m2", runner=runner).runner.model == "m2"
+        assert runner.model == "from-profile"
+        assert not isinstance(make_lm("openai/gpt-4.1-mini"), HermesLM)
