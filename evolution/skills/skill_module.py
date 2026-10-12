@@ -11,6 +11,8 @@ from typing import Optional
 
 import dspy
 
+from evolution.core.hermes_runner import HermesRunner
+
 
 def load_skill(skill_path: Path) -> dict:
     """Load a skill file and parse its frontmatter + body.
@@ -121,6 +123,63 @@ class SkillModule(dspy.Module):
         # Carry the candidate's own size so a metric can price growth during
         # optimization instead of discovering it at the final constraint gate.
         return dspy.Prediction(output=result.output, skill_chars=len(self.skill_text))
+
+
+class HermesSkillModule(dspy.Module):
+    """Evaluates the candidate skill by running the real Hermes agent on each task.
+
+    The predictor is never called: it only holds the skill text as signature
+    instructions, which is the component GEPA mutates. ``forward`` installs
+    the current text as the skill, runs the task through Hermes with its real
+    tools, and records a trace entry for the predictor so GEPA's reflection
+    sees what Hermes actually did (tool calls and their results).
+    """
+
+    def __init__(
+        self,
+        skill_text: str,
+        *,
+        skill_name: str,
+        frontmatter: str,
+        runner: HermesRunner,
+        skill_dir: Optional[Path] = None,
+    ):
+        super().__init__()
+        self.predictor = dspy.Predict(SkillModule.TaskWithSkill.with_instructions(skill_text))
+        self.skill_name = skill_name
+        self.frontmatter = frontmatter
+        self.runner = runner
+        self.skill_dir = skill_dir
+
+    @property
+    def skill_text(self) -> str:
+        """The current skill text — evolved instructions after optimization."""
+        return self.predictor.signature.instructions
+
+    def forward(self, task_input: str) -> dspy.Prediction:
+        run = self.runner.run(
+            skill_name=self.skill_name,
+            skill_file=reassemble_skill(self.frontmatter, self.skill_text),
+            task=task_input,
+            skill_dir=self.skill_dir,
+        )
+        transcript = run.transcript()
+        _record_trace(self.predictor, {"task_input": task_input}, dspy.Prediction(output=transcript))
+        return dspy.Prediction(
+            output=run.final_text,
+            transcript=transcript,
+            skill_chars=len(self.skill_text),
+        )
+
+
+def _record_trace(predictor: dspy.Predict, inputs: dict, prediction: dspy.Prediction) -> None:
+    """Append a trace entry the way ``dspy.Predict`` does after its own LM call."""
+    trace = dspy.settings.trace
+    if trace is None or dspy.settings.max_trace_size <= 0:
+        return
+    if len(trace) >= dspy.settings.max_trace_size:
+        trace.pop(0)
+    trace.append((predictor, inputs, prediction))
 
 
 def reassemble_skill(frontmatter: str, evolved_body: str) -> str:

@@ -93,7 +93,7 @@ def test_cli_dry_run_honors_explicit_repo(tmp_path, monkeypatch):
 
     result = CliRunner().invoke(
         main,
-        ["--skill", "demo", "--hermes-repo", str(repo), "--dry-run"],
+        ["--skill", "demo", "--hermes-repo", str(repo), "--dry-run", "--executor", "dspy"],
     )
 
     assert result.exit_code == 0, result.output

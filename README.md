@@ -49,6 +49,26 @@ python -m evolution.skills.evolve_skill \
     --eval-source sessiondb
 ```
 
+## How Tasks Are Evaluated
+
+By default (`--executor hermes`), every train, validation and holdout task is run by the real Hermes agent with the candidate skill loaded:
+
+```bash
+hermes chat -q "<task>" --oneshot --format stream-json -s <skill>
+```
+
+- **A throwaway profile per run.** Each run uses a temporary `HERMES_HOME` that holds only the candidate skill (plus the skill's own `scripts/` and `references/`). Into it are copied your `config.yaml`, `.env`, `auth.json` and `SOUL.md`, from `--hermes-home` (default: `$HERMES_HOME`, else `~/.hermes`).
+- **Your real setup, untouched.** The task therefore runs with your model, your credentials and Hermes's real tools. The evaluation's sessions and memories never touch your profile.
+- **What gets scored.** The scorer grades the final answer; the semantic judge also sees the tool calls. GEPA's reflection reads the full transcript of what Hermes did.
+
+Use `--hermes-command` when `hermes` is not on `PATH`, for example `'/path/to/venv/bin/python -m hermes_cli.main'`. `--hermes-model`, `--hermes-provider`, `--hermes-toolsets`, `--hermes-max-turns` and `--hermes-timeout` tune the runs.
+
+**Cost and speed.** Every example is a full agent run, with several model calls and real tool execution, so a run costs and takes far more than a bare LLM call. Start with a small dataset and few iterations.
+
+**Safety.** Tools run for real on this machine, in a scratch working directory. Hermes is not started with `--yolo`, so its usual command approval rules apply. Restrict the run with `--hermes-toolsets`, or point `--hermes-home` at a profile that uses a sandboxed terminal backend.
+
+`--executor dspy` replaces the agent with a single LLM call that reads the skill text and has no tools. It is kept for offline experiments only: it does not measure what users get.
+
 ## What It Optimizes
 
 | Phase | Target | Engine | Status |

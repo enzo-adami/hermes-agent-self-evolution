@@ -229,10 +229,12 @@ class SemanticSkillFitnessMetric:
                 return dspy.Prediction(score=0.0, feedback="The response was empty.")
             return 0.0
 
+        # A Hermes run also carries its tool-call transcript: procedure is
+        # judged on what the agent did, not only on what it said it did.
         judged = self.judge.score(
             task_input=task_input,
             expected_behavior=expected,
-            agent_output=agent_output,
+            agent_output=getattr(prediction, "transcript", None) or agent_output,
         )
         gaming_signal = _metric_gaming_signal(task_input, agent_output)
         feedback = judged.feedback
