@@ -197,7 +197,7 @@ def test_run_tests_failure_stops_before_holdout_and_output(tmp_path, monkeypatch
             skill_name="demo",
             eval_source="golden",
             dataset_path=str(tmp_path),
-            hermes_repo=str(repo),
+            hermes_repo=str(repo), executor="dspy",
             run_tests=True,
         )
 
@@ -240,7 +240,7 @@ def test_noop_candidate_cannot_report_success_from_score_noise(tmp_path, monkeyp
         skill_name="demo",
         eval_source="golden",
         dataset_path=str(tmp_path),
-        hermes_repo=str(repo),
+        hermes_repo=str(repo), executor="dspy",
         # Pin the lexical scorer: this test stubs skill_fitness_metric to feed
         # deterministic scores, and the semantic default would build an LLM
         # judge the stub cannot intercept. The property under test — a no-op
@@ -290,7 +290,7 @@ def test_rejected_runs_in_same_second_preserve_both_artifacts(tmp_path, monkeypa
     for _ in range(2):
         evolve_skill.evolve(
             skill_name="demo", eval_source="golden", dataset_path=str(tmp_path),
-            hermes_repo=str(repo),
+            hermes_repo=str(repo), executor="dspy",
         )
 
     artifacts = list((tmp_path / "output/demo").glob("*/evolved_FAILED.md"))

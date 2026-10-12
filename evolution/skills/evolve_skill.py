@@ -6,6 +6,8 @@ Usage:
 """
 
 import json
+import shlex
+import shutil
 import sys
 import tempfile
 import time
@@ -21,6 +23,7 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
+from evolution.core.hermes_runner import HermesRunner, default_hermes_home
 from evolution.core.fitness import (
     make_semantic_skill_fitness_metric,
     skill_fitness_metric,
@@ -28,6 +31,7 @@ from evolution.core.fitness import (
 from evolution.core.constraints import ConstraintValidator
 from evolution.core.verifier import get_verifier, verifier_metric
 from evolution.skills.skill_module import (
+    HermesSkillModule,
     SkillModule,
     load_skill,
     find_skill,
@@ -126,6 +130,8 @@ def evolve(
     judge_model: Optional[str] = None,
     judge_max_tokens: int = 2500,
     fitness: str = "auto",
+    executor: str = "hermes",
+    hermes_runner: Optional[HermesRunner] = None,
 ):
     """Main evolution function — orchestrates the full optimization loop."""
 
@@ -166,6 +172,24 @@ def evolve(
         fitness_label = "semantic judge"
     else:
         fitness_label = "keyword overlap"
+
+    runner = None
+    if executor == "hermes":
+        runner = hermes_runner or HermesRunner()
+        executable = runner.command[0]
+        if shutil.which(executable) is None and not Path(executable).is_file():
+            console.print(
+                f"[red]✗ Hermes command not found: {executable!r}. Install Hermes or pass "
+                "--hermes-command (e.g. '/path/to/venv/bin/python -m hermes_cli.main').[/red]"
+            )
+            sys.exit(1)
+        executor_label = (
+            f"real Hermes agent ({' '.join(runner.command)}, profile "
+            f"{runner.source_home or default_hermes_home()})"
+        )
+    else:
+        executor_label = "bare LLM call without Hermes tools (not representative of real use)"
+    console.print(f"  Executor: {executor_label}")
 
     if dry_run:
         console.print("\n[bold green]DRY RUN — setup validated successfully.[/bold green]")
@@ -286,7 +310,16 @@ def evolve(
         metric = skill_fitness_metric
 
     # Create the baseline skill module
-    baseline_module = SkillModule(skill["body"])
+    if runner is not None:
+        baseline_module = HermesSkillModule(
+            skill["body"],
+            skill_name=skill["name"] or skill_path.parent.name,
+            frontmatter=skill["frontmatter"],
+            runner=runner,
+            skill_dir=skill_path.parent,
+        )
+    else:
+        baseline_module = SkillModule(skill["body"])
 
     # Prepare DSPy examples
     trainset = dataset.to_dspy_examples("train")
@@ -442,6 +475,7 @@ def evolve(
         "elapsed_seconds": elapsed,
         "constraints_passed": all_pass,
         "fitness": fitness_label,
+        "executor": executor,
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
@@ -492,7 +526,22 @@ def evolve(
               help="Fitness signal: auto uses an objective verifier when one is registered "
                    "for the skill and --scorer otherwise, verifier requires one, scorer "
                    "always uses --scorer")
-def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, max_tokens, temperature, num_threads, lm_timeout, lm_retries, scorer, judge_model, judge_max_tokens, fitness):
+@click.option("--executor", default="hermes", show_default=True, type=click.Choice(["hermes", "dspy"]),
+              help="hermes runs every task through the real Hermes agent and its tools; "
+                   "dspy is a bare LLM call that only reads the skill (no tools)")
+@click.option("--hermes-command", default="hermes", show_default=True,
+              help="How to invoke Hermes, e.g. '/path/to/venv/bin/python -m hermes_cli.main'")
+@click.option("--hermes-home", default=None,
+              help="Profile whose config, keys and persona the runs use (default: $HERMES_HOME or ~/.hermes)")
+@click.option("--hermes-model", default=None, help="Override the model Hermes runs tasks with")
+@click.option("--hermes-provider", default=None, help="Override the provider Hermes runs tasks with")
+@click.option("--hermes-toolsets", default=None, help="Comma-separated toolsets for the runs (default: profile's)")
+@click.option("--hermes-max-turns", default=20, show_default=True, type=int,
+              help="Tool-calling iterations allowed per task")
+@click.option("--hermes-timeout", default=600.0, show_default=True, type=float,
+              help="Seconds before a task run is abandoned")
+def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_model, hermes_repo, run_tests, dry_run, max_tokens, temperature, num_threads, lm_timeout, lm_retries, scorer, judge_model, judge_max_tokens, fitness,
+         executor, hermes_command, hermes_home, hermes_model, hermes_provider, hermes_toolsets, hermes_max_turns, hermes_timeout):
     """Evolve a Hermes Agent skill using DSPy + GEPA optimization."""
     evolve(
         skill_name=skill,
@@ -513,6 +562,16 @@ def main(skill, iterations, eval_source, dataset_path, optimizer_model, eval_mod
         judge_model=judge_model,
         judge_max_tokens=judge_max_tokens,
         fitness=fitness,
+        executor=executor,
+        hermes_runner=HermesRunner(
+            command=tuple(shlex.split(hermes_command)),
+            source_home=Path(hermes_home).expanduser() if hermes_home else None,
+            model=hermes_model,
+            provider=hermes_provider,
+            toolsets=hermes_toolsets,
+            max_turns=hermes_max_turns,
+            timeout=hermes_timeout,
+        ),
     )
 
 
