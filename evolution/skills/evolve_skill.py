@@ -23,6 +23,7 @@ from rich.table import Table
 from evolution.core.config import EvolutionConfig, resolve_hermes_agent_path
 from evolution.core.dataset_builder import SyntheticDatasetBuilder, EvalDataset, GoldenDatasetLoader
 from evolution.core.external_importers import build_dataset_from_external
+from evolution.core.hermes_lm import is_hermes_model, make_lm
 from evolution.core.hermes_runner import HermesRunner, default_hermes_home
 from evolution.core.fitness import (
     make_semantic_skill_fitness_metric,
@@ -173,16 +174,21 @@ def evolve(
     else:
         fitness_label = "keyword overlap"
 
-    runner = None
-    if executor == "hermes":
-        runner = hermes_runner or HermesRunner()
-        executable = runner.command[0]
+    hermes = hermes_runner or HermesRunner()
+    config.hermes_runner = hermes
+    uses_hermes = executor == "hermes" or any(
+        is_hermes_model(m) for m in (optimizer_model, eval_model, judge_model)
+    )
+    if uses_hermes:
+        executable = hermes.command[0]
         if shutil.which(executable) is None and not Path(executable).is_file():
             console.print(
                 f"[red]✗ Hermes command not found: {executable!r}. Install Hermes or pass "
                 "--hermes-command (e.g. '/path/to/venv/bin/python -m hermes_cli.main').[/red]"
             )
             sys.exit(1)
+    runner = hermes if executor == "hermes" else None
+    if runner is not None:
         executor_label = (
             f"real Hermes agent ({' '.join(runner.command)}, profile "
             f"{runner.source_home or default_hermes_home()})"
@@ -226,6 +232,7 @@ def evolve(
             sources=["claude-code", "copilot", "hermes"],
             output_path=save_path,
             model=eval_model,
+            hermes_runner=hermes,
         )
         if not dataset.all_examples:
             console.print("[red]✗ No relevant examples found from session history[/red]")
@@ -289,7 +296,7 @@ def evolve(
         lm_kwargs["timeout"] = lm_timeout
     if lm_retries is not None:
         lm_kwargs["num_retries"] = lm_retries
-    lm = dspy.LM(eval_model, **lm_kwargs)
+    lm = make_lm(eval_model, runner=hermes, **lm_kwargs)
     dspy.configure(lm=lm)
 
     if verifier is not None:
@@ -302,7 +309,7 @@ def evolve(
         # corrupts the measurement rather than merely shortening it.
         judge_kwargs["max_tokens"] = judge_max_tokens
         metric = make_semantic_skill_fitness_metric(
-            dspy.LM(judge_model or eval_model, **judge_kwargs),
+            make_lm(judge_model or eval_model, runner=hermes, **judge_kwargs),
             baseline_chars=len(skill["body"]),
             max_growth=config.max_prompt_growth,
         )
@@ -335,7 +342,7 @@ def evolve(
     # and a reflection LM for proposing mutations. Construct the reflection LM
     # before the compatibility boundary so its own configuration errors cannot
     # masquerade as an unavailable GEPA API.
-    reflection_lm = dspy.LM(optimizer_model, **lm_kwargs)
+    reflection_lm = make_lm(optimizer_model, runner=hermes, **lm_kwargs)
     optimized_module, optimizer_name = _compile_optimizer(
         metric=metric,
         iterations=iterations,
@@ -500,8 +507,10 @@ def evolve(
 @click.option("--eval-source", default="synthetic", type=click.Choice(["synthetic", "golden", "sessiondb"]),
               help="Source for evaluation dataset")
 @click.option("--dataset-path", default=None, help="Path to existing eval dataset (JSONL)")
-@click.option("--optimizer-model", default="openai/gpt-4.1", help="Model for GEPA reflections")
-@click.option("--eval-model", default="openai/gpt-4.1-mini", help="Model for evaluations")
+@click.option("--optimizer-model", default="openai/gpt-4.1",
+              help="Model for GEPA reflections; 'hermes' or 'hermes/<model>' answers through your Hermes")
+@click.option("--eval-model", default="openai/gpt-4.1-mini",
+              help="Model for evaluations and dataset generation; 'hermes' works here too")
 @click.option("--hermes-repo", default=None, help="Path to hermes-agent repo")
 @click.option("--run-tests", is_flag=True, help="Run full pytest suite as constraint gate")
 @click.option("--dry-run", is_flag=True, help="Validate setup without running optimization")

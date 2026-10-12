@@ -3,7 +3,7 @@
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 
 @dataclass
@@ -45,6 +45,9 @@ class EvolutionConfig:
     # Output
     output_dir: Path = field(default_factory=lambda: Path("./output"))
     create_pr: bool = True
+
+    # How to reach the user's Hermes when a model is named "hermes" (a HermesRunner).
+    hermes_runner: Optional[Any] = None
 
 
 def _discover_hermes_agent_path() -> Optional[Path]:

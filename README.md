@@ -67,6 +67,12 @@ Use `--hermes-command` when `hermes` is not on `PATH`, for example `'/path/to/ve
 
 **Safety.** Tools run for real on this machine, in a scratch working directory. Hermes is not started with `--yolo`, so its usual command approval rules apply. Restrict the run with `--hermes-toolsets`, or point `--hermes-home` at a profile that uses a sandboxed terminal backend.
 
+**No API key needed.** The model names `--optimizer-model`, `--eval-model` and `--judge-model` also accept `hermes`, or `hermes/<model>` to pick another model. Those calls (GEPA's reflection, the judge, dataset generation) then go through your Hermes too. They run with no tools and no skill, on the same credentials.
+
+```bash
+python -m evolution.skills.evolve_skill --skill arxiv --optimizer-model hermes --eval-model hermes
+```
+
 `--executor dspy` replaces the agent with a single LLM call that reads the skill text and has no tools. It is kept for offline experiments only: it does not measure what users get.
 
 ## What It Optimizes

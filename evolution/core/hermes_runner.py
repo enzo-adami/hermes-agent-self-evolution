@@ -120,27 +120,34 @@ class HermesRunner:
     max_turns: int = 20
     timeout: float = 600.0
 
+    def _model_flags(self) -> list[str]:
+        flags = []
+        if self.model:
+            flags += ["-m", self.model]
+        if self.provider:
+            flags += ["--provider", self.provider]
+        return flags
+
     def build_command(self, skill_name: str, task: str) -> list[str]:
         cmd = [
             *self.command, "chat", "-q", task, "--oneshot", "--format", "stream-json",
-            "-s", skill_name, "--max-turns", str(self.max_turns),
+            "-s", skill_name, "--max-turns", str(self.max_turns), *self._model_flags(),
         ]
-        if self.model:
-            cmd += ["-m", self.model]
-        if self.provider:
-            cmd += ["--provider", self.provider]
         if self.toolsets:
             cmd += ["-t", self.toolsets]
         return cmd
 
-    def prepare_home(self, home: Path, skill_name: str, skill_file: str, skill_dir: Optional[Path]) -> None:
-        """Populate a throwaway HERMES_HOME holding the candidate skill."""
+    def _copy_profile(self, home: Path) -> None:
         source = self.source_home or default_hermes_home()
         home.mkdir(parents=True, exist_ok=True)
         for name in _PROFILE_FILES:
             if (source / name).is_file():
                 shutil.copy2(source / name, home / name)
         (home / ".no-bundled-skills").touch()
+
+    def prepare_home(self, home: Path, skill_name: str, skill_file: str, skill_dir: Optional[Path]) -> None:
+        """Populate a throwaway HERMES_HOME holding the candidate skill."""
+        self._copy_profile(home)
         dest = home / "skills" / skill_name
         if skill_dir is not None and skill_dir.is_dir():
             # Keep the skill's scripts/ and references/ next to the candidate text.
@@ -149,29 +156,48 @@ class HermesRunner:
         (dest / "SKILL.md").write_text(skill_file)
 
     def run(self, skill_name: str, skill_file: str, task: str, skill_dir: Optional[Path] = None) -> HermesRun:
-        tmp = Path(tempfile.mkdtemp(prefix="hermes-eval-"))
-        try:
-            home = tmp / "home"
-            workspace = tmp / "workspace"
-            workspace.mkdir()
+        """Run ``task`` through the agent with the candidate skill and the profile's tools."""
+        with tempfile.TemporaryDirectory(prefix="hermes-eval-") as tmp:
+            home = Path(tmp) / "home"
             self.prepare_home(home, skill_name, skill_file, skill_dir)
-            try:
-                proc = subprocess.run(
-                    self.build_command(skill_name, task),
-                    cwd=workspace,
-                    env={**os.environ, "HERMES_HOME": str(home)},
-                    capture_output=True,
-                    text=True,
-                    timeout=self.timeout,
-                )
-            except subprocess.TimeoutExpired:
-                return HermesRun(exit_code=-1, error=f"timed out after {self.timeout:.0f}s")
-            except OSError as exc:
-                return HermesRun(exit_code=-1, error=f"could not start Hermes: {exc}")
-            run = parse_stream_json(proc.stdout)
-            if proc.returncode and not run.error:
-                run.exit_code = proc.returncode
-                run.error = proc.stderr.strip()[-500:] or f"exit code {proc.returncode}"
-            return run
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+            return self._execute(self.build_command(skill_name, task), home, Path(tmp))
+
+    def ask(self, prompt: str) -> HermesRun:
+        """One answer from the profile's model, with no tools and no skill.
+
+        Used where the pipeline needs a plain LLM (GEPA reflection, the judge,
+        dataset generation) so it runs on the user's Hermes credentials. The
+        prompt goes through a file: reflection prompts outgrow argv limits.
+        """
+        with tempfile.TemporaryDirectory(prefix="hermes-ask-") as tmp:
+            home = Path(tmp) / "home"
+            self._copy_profile(home)
+            prompt_file = Path(tmp) / "prompt.txt"
+            prompt_file.write_text(prompt)
+            cmd = [
+                *self.command, "chat", "--query-file", str(prompt_file), "--oneshot",
+                "--format", "stream-json", "-t", "none", "--max-turns", "1", *self._model_flags(),
+            ]
+            return self._execute(cmd, home, Path(tmp))
+
+    def _execute(self, cmd: list[str], home: Path, tmp: Path) -> HermesRun:
+        workspace = tmp / "workspace"
+        workspace.mkdir()
+        try:
+            proc = subprocess.run(
+                cmd,
+                cwd=workspace,
+                env={**os.environ, "HERMES_HOME": str(home)},
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return HermesRun(exit_code=-1, error=f"timed out after {self.timeout:.0f}s")
+        except OSError as exc:
+            return HermesRun(exit_code=-1, error=f"could not start Hermes: {exc}")
+        run = parse_stream_json(proc.stdout)
+        if proc.returncode and not run.error:
+            run.exit_code = proc.returncode
+            run.error = proc.stderr.strip()[-500:] or f"exit code {proc.returncode}"
+        return run
